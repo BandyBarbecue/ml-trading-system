@@ -1,0 +1,10 @@
+# --- Phase 0 (data ingestion) ---
+alpaca-py>=0.33
+pandas>=2.0
+python-dotenv>=1.0
+
+# --- Phase 1+ (backtesting) ---
+# Install this when you reach Phase 1. It pulls in numba/llvmlite, which can be a
+# slow/finicky install, so it's kept separate to keep your first setup smooth:
+#   pip install vectorbt
+# vectorbt>=0.26
