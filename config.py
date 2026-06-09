@@ -1,5 +1,6 @@
 # config.py — single source of truth for the entire system
 from pathlib import Path
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 
@@ -24,7 +25,6 @@ VIX_FILE      = DATA_DIR / "vix.parquet"
 FALLBACK_SYMBOLS = ["AAPL", "MSFT", "JNJ", "KO", "SPY"]
 
 # --- Date range (5-year lookback) ---
-from datetime import datetime, timedelta
 END_DATE   = datetime.now().strftime("%Y-%m-%d")
 START_DATE = (datetime.now() - timedelta(days=1825)).strftime("%Y-%m-%d")
 
