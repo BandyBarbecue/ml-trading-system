@@ -1,10 +1,25 @@
-# --- Phase 0 (data ingestion) ---
+# Data & I/O
 alpaca-py>=0.33
 pandas>=2.0
-python-dotenv>=1.0
+pyarrow>=14.0
+yfinance>=0.2
+requests>=2.31
 
-# --- Phase 1+ (backtesting) ---
-# Install this when you reach Phase 1. It pulls in numba/llvmlite, which can be a
-# slow/finicky install, so it's kept separate to keep your first setup smooth:
-#   pip install vectorbt
-# vectorbt>=0.26
+# ML
+lightgbm>=4.0
+scikit-learn>=1.3
+scipy>=1.11
+optuna>=3.4
+shap>=0.44
+
+# NLP / AI
+anthropic>=0.34
+
+# Utilities
+python-dotenv>=1.0
+vectorbt>=0.26
+lxml>=4.9
+
+# Testing
+pytest>=7.4
+pytest-mock>=3.11
