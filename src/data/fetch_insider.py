@@ -39,7 +39,7 @@ def _get_cik_map() -> dict[str, str]:
     cache = config.DATA_DIR / "sec_cik_map.json"
     if cache.exists():
         return json.loads(cache.read_text())
-    url = f"{EDGAR_BASE}/files/company_tickers.json"
+    url = "https://www.sec.gov/files/company_tickers.json"
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     raw = r.json()
