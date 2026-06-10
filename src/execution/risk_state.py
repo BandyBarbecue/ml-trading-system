@@ -38,8 +38,11 @@ def get_peak_value(current_value: float) -> float:
         except (json.JSONDecodeError, OSError):
             state = {}
 
-    stored_peak = state.get("peak_value", 0.0)
-    new_peak    = max(stored_peak, current_value)
+    try:
+        stored_peak = float(state.get("peak_value", 0.0))
+    except (TypeError, ValueError):
+        stored_peak = 0.0
+    new_peak = max(stored_peak, current_value)
 
     state["peak_value"] = new_peak
     path.parent.mkdir(parents=True, exist_ok=True)
