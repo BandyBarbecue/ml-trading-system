@@ -184,6 +184,7 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
         ("earnings",     "src.data.fetch_earnings",     "update_earnings"),
         ("fundamentals", "src.data.fetch_fundamentals", "update_fundamentals"),
         ("insider",      "src.data.fetch_insider",      "update_insider"),
+        ("macro",        "src.data.fetch_macro",        "update_macro"),
     ]:
         try:
             import importlib
@@ -222,6 +223,7 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
     # ------------------------------------------------------------------
     feature_matrix = pd.DataFrame()
     tracker = None
+    regime_feature_weights: dict[str, float] = {}
 
     try:
         from src.features.feature_matrix import build_feature_matrix
@@ -255,6 +257,18 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
                     tracker.update(col, ic)
             tracker.save()  # persist to data/features/ic_tracker.json
 
+        # Compute regime weights (empty dict = no modulation if anything fails)
+        try:
+            from src.ml.regime_classifier import classify_regime, get_regime_feature_weights
+            macro_path = config.DATA_DIR / "macro" / "macro.parquet"
+            if macro_path.exists():
+                macro_df = pd.read_parquet(macro_path)
+                regime = classify_regime(macro_df)
+                regime_feature_weights = get_regime_feature_weights(regime)
+                logger.info("Regime: %s (modulation keys: %s)", regime, list(regime_feature_weights.keys()))
+        except Exception as exc:
+            logger.warning("Regime classification failed: %s", exc)
+
         result["step"] = 3
         logger.info("Step 3 complete: feature matrix built (%s rows).", len(feature_matrix))
     except Exception as exc:
@@ -277,10 +291,15 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
         if (is_first_month or existing_model is None) and not feature_matrix.empty:
             reason = "1st of month — retraining" if existing_model else "no saved model — training initial"
             logger.info("Step 4: %s.", reason)
+            # Combine IC-based weights with regime modulation
             feature_weights = get_feature_weights(tracker) if tracker else {}
+            combined_weights: dict[str, float] = {
+                k: feature_weights.get(k, 1.0) * regime_feature_weights.get(k, 1.0)
+                for k in set(feature_weights) | set(regime_feature_weights)
+            } if (feature_weights or regime_feature_weights) else {}
             model = train(
                 feature_matrix,
-                feature_weights=feature_weights if feature_weights else None,
+                feature_weights=combined_weights if combined_weights else None,
                 save=True,
             )
         else:
@@ -327,6 +346,23 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
             logger.info(
                 "Step 5 complete: portfolio built (%d positions).", len(weights)
             )
+
+            # Short portfolio (only when LONG_SHORT_ENABLED — disabled by default)
+            if config.LONG_SHORT_ENABLED:
+                from src.portfolio.construction import build_short_portfolio
+                short_weights = build_short_portfolio(
+                    result["scores"], sector_map, pd.Series(dtype=float), recent_returns
+                )
+                if not short_weights.empty:
+                    # Merge long + short into a single weights Series
+                    weights = pd.concat([weights, short_weights])
+                    result["weights"] = weights
+                    trades = compute_trades(weights, current_weights)
+                    result["trades"] = trades
+                    logger.info(
+                        "Step 5: long-short — %d long, %d short positions.",
+                        (weights > 0).sum(), (weights < 0).sum(),
+                    )
 
             # Log a feature breakdown for every selected ticker so there is a
             # human-readable record of what drove each pick.

@@ -157,7 +157,27 @@ class RiskEngine:
                     }))
 
         # ----------------------------------------------------------
-        # 5. Re-normalise — surviving weights should sum to 1.0
+        # 5. Gross exposure cap (only when long-short is enabled)
+        #    Gross exposure = sum of absolute weights (long + |short|).
+        #    If the combined exposure would exceed GROSS_EXPOSURE_CAP, scale
+        #    every weight down proportionally so the cap is met exactly.
+        # ----------------------------------------------------------
+        if config.LONG_SHORT_ENABLED and not kill_switch_fired:
+            gross = float(weights.abs().sum())
+            cap   = config.GROSS_EXPOSURE_CAP
+            if gross > cap:
+                scale = cap / gross
+                weights = (weights * scale).round(6)
+                decisions.append(self._log({
+                    "control":   "gross_exposure_cap",
+                    "triggered": True,
+                    "gross":     round(gross, 4),
+                    "scale":     round(scale, 4),
+                    "cap":       cap,
+                }))
+
+        # ----------------------------------------------------------
+        # 6. Re-normalise — surviving weights should sum to 1.0
         #    (skip if kill switch fired — all zeros, nothing to normalise)
         # ----------------------------------------------------------
         if not kill_switch_fired:
