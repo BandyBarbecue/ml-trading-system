@@ -1,27 +1,22 @@
 import pandas as pd
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import config
 
-MOCK_FMP_RESPONSE = [
-    {
-        "date": "2024-09-30",
-        "grossProfitMargin": 0.46,
-        "priceToBookRatio": 42.5,
-        "revenue": 94000000000,
-    }
-]
+
+def _mock_ticker(pb=42.5, gm=0.46):
+    """Return a mock yf.Ticker whose .info dict contains the given values."""
+    mock = MagicMock()
+    mock.info = {"priceToBook": pb, "grossMargins": gm}
+    return mock
 
 
 def test_update_fundamentals_writes_parquet(tmp_path, monkeypatch):
     from src.data import fetch_fundamentals
 
     monkeypatch.setattr(config, "FUNDAMENTALS_FILE", tmp_path / "fundamentals.parquet")
-    monkeypatch.setattr(config, "FMP_API_KEY", "test-key")
 
-    with patch("src.data.fetch_fundamentals.requests.get") as mock_get:
-        mock_get.return_value.json.return_value = MOCK_FMP_RESPONSE
-        mock_get.return_value.raise_for_status = lambda: None
+    with patch("src.data.fetch_fundamentals.yf.Ticker", return_value=_mock_ticker()):
         fetch_fundamentals.update_fundamentals(symbols=["AAPL"])
 
     df = pd.read_parquet(tmp_path / "fundamentals.parquet")
@@ -31,28 +26,32 @@ def test_update_fundamentals_writes_parquet(tmp_path, monkeypatch):
     assert df["pb_ratio"].iloc[0] == pytest.approx(42.5)
 
 
-def test_update_fundamentals_no_api_key_skips(tmp_path, monkeypatch):
+def test_update_fundamentals_handles_missing_values(tmp_path, monkeypatch):
+    """When Yahoo returns None for a field, it is stored as None (not a crash)."""
     from src.data import fetch_fundamentals
 
     monkeypatch.setattr(config, "FUNDAMENTALS_FILE", tmp_path / "fundamentals.parquet")
-    monkeypatch.setattr(config, "FMP_API_KEY", "")
 
-    fetch_fundamentals.update_fundamentals(symbols=["AAPL"])
-    assert not (tmp_path / "fundamentals.parquet").exists()
+    mock = MagicMock()
+    mock.info = {"priceToBook": None, "grossMargins": None}
+
+    with patch("src.data.fetch_fundamentals.yf.Ticker", return_value=mock):
+        fetch_fundamentals.update_fundamentals(symbols=["NEWIPO"])
+
+    df = pd.read_parquet(tmp_path / "fundamentals.parquet")
+    assert len(df) == 1
+    assert pd.isna(df["pb_ratio"].iloc[0])
+    assert pd.isna(df["gross_profitability"].iloc[0])
 
 
 def test_update_fundamentals_deduplicates(tmp_path, monkeypatch):
     from src.data import fetch_fundamentals
 
     monkeypatch.setattr(config, "FUNDAMENTALS_FILE", tmp_path / "fundamentals.parquet")
-    monkeypatch.setattr(config, "FMP_API_KEY", "test-key")
 
-    with patch("src.data.fetch_fundamentals.requests.get") as mock_get:
-        mock_get.return_value.json.return_value = MOCK_FMP_RESPONSE
-        mock_get.return_value.raise_for_status = lambda: None
-        # Call twice with same data
+    with patch("src.data.fetch_fundamentals.yf.Ticker", return_value=_mock_ticker()):
         fetch_fundamentals.update_fundamentals(symbols=["AAPL"])
         fetch_fundamentals.update_fundamentals(symbols=["AAPL"])
 
     df = pd.read_parquet(tmp_path / "fundamentals.parquet")
-    assert len(df) == 1  # should not have duplicated the row
+    assert len(df) == 1  # second call same date → upsert, not duplicate

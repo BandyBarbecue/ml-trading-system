@@ -1,85 +1,94 @@
 """
-fetch_fundamentals.py — Pull gross profitability and P/B ratio from FMP.
+fetch_fundamentals.py — Pull gross profitability and P/B ratio via yfinance.
 
-FMP endpoint: GET /key-metrics/{symbol}?limit=20&apikey=...
-Returns a list of quarterly snapshots newest-first.
+FMP's v3 key-metrics endpoint was retired for new accounts after August 2025.
+yfinance (Yahoo Finance) is free and already a project dependency.
 
-45-day reporting lag rule: financials filed with the SEC up to 45 days after
-quarter end. We store the raw filing date and enforce the lag in the feature
-function, not here. The data layer just stores what FMP reports.
+Metrics fetched from yf.Ticker(ticker).info per ticker:
+  priceToBook   → pb_ratio
+  grossMargins  → gross_profitability
+    (grossMargins = gross profit / revenue — a close proxy for Novy-Marx
+     gross profitability. The exact Novy-Marx definition uses total assets
+     as the denominator, but that requires a separate balance-sheet API call
+     per ticker which would make the 500-ticker update ~10× slower.)
+
+45-day lag rule: enforced in fundamental_features.py, not here. This module
+just stores today's snapshot with today's date. The feature function picks
+the most recent snapshot that predates the query date by 45+ days.
 """
 
 import logging
+import time
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
-import requests
+import yfinance as yf
 
 import config
 
 log = logging.getLogger(__name__)
 
+_SLEEP_BETWEEN = 0.05  # seconds between tickers — polite to Yahoo Finance
+
 
 def update_fundamentals(symbols: list[str] | None = None) -> None:
-    """Fetch FMP key-metrics for each symbol and append to fundamentals.parquet.
+    """Fetch P/B ratio and gross margins for each symbol and save to parquet.
 
-    Uses config.FUNDAMENTALS_FILE as the target path — override via monkeypatch
-    in tests (same pattern as fetch_earnings.py).
+    Skips tickers where Yahoo Finance returns no data (common for recent IPOs).
+    Progress is logged every 50 tickers.
+
+    Args:
+        symbols: List of ticker strings. Defaults to S&P 500 universe.
     """
-    if not config.FMP_API_KEY:
-        log.warning("FMP_API_KEY not set — skipping fundamentals update.")
-        return
-
     if symbols is None:
         from src.data.sp500_universe import get_symbols
         symbols = get_symbols()
 
+    today = date.today().isoformat()
+    records = []
+
+    for i, ticker in enumerate(symbols):
+        try:
+            info = yf.Ticker(ticker).info
+            pb = info.get("priceToBook")
+            gm = info.get("grossMargins")
+            records.append({
+                "ticker":              ticker,
+                "date":                today,
+                "gross_profitability": float(gm) if gm is not None else None,
+                "pb_ratio":            float(pb) if pb is not None else None,
+            })
+        except Exception as exc:
+            log.warning("fundamentals: skipping %s — %s", ticker, exc)
+
+        if i > 0 and i % 50 == 0:
+            log.info("fundamentals: %d/%d tickers fetched", i, len(symbols))
+
+        time.sleep(_SLEEP_BETWEEN)
+
+    if not records:
+        log.warning("fundamentals: no data fetched — Yahoo Finance may be unavailable.")
+        return
+
+    new_df = pd.DataFrame(records)
+
     out_path: Path = config.FUNDAMENTALS_FILE
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    existing = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame()
-    existing_keys = set(
-        zip(existing["ticker"], existing["date"])
-    ) if not existing.empty else set()
+    if out_path.exists():
+        existing = pd.read_parquet(out_path)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+    else:
+        combined = new_df
 
-    rows = []
-    for sym in symbols:
-        url = f"{config.FMP_BASE_URL}/key-metrics/{sym}"
-        params = {"limit": 20, "apikey": config.FMP_API_KEY}
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            r.raise_for_status()
-            for snap in r.json():
-                date_str = snap.get("date", "")
-                if (sym, date_str) in existing_keys:
-                    continue
-                rows.append({
-                    "ticker":              sym,
-                    "date":                date_str,
-                    "gross_profitability": snap.get("grossProfitMargin"),
-                    "pb_ratio":            snap.get("priceToBookRatio"),
-                })
-        except requests.exceptions.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code in (401, 403):
-                log.error("FMP API authentication failed — aborting. Check FMP_API_KEY.")
-                return  # abort entire update
-            log.warning("fundamentals HTTP error for %s: %s", sym, exc)
-        except Exception as exc:
-            log.warning("fundamentals fetch failed for %s: %s", sym, exc)
-
-    if not rows:
-        return
-
-    new_df = pd.DataFrame(rows)
-    combined = pd.concat([existing, new_df], ignore_index=True).drop_duplicates(
-        subset=["ticker", "date"], keep="last"
-    )
+    combined = combined.drop_duplicates(subset=["ticker", "date"], keep="last")
     combined.to_parquet(out_path, index=False)
-    log.info("Fundamentals: wrote %d rows to %s", len(combined), out_path)
+    log.info("fundamentals: saved %d rows to %s", len(combined), out_path)
 
 
 if __name__ == "__main__":
-    import sys
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s — %(message)s")
+    import logging as _logging
+    _logging.basicConfig(level=_logging.INFO, format="%(asctime)s %(levelname)-8s — %(message)s")
     from src.data.sp500_universe import get_symbols
     update_fundamentals(get_symbols())
