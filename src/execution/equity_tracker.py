@@ -34,14 +34,25 @@ def update_equity(account_value: float, as_of: date | None = None) -> None:
 
     out_path: Path = config.DATA_DIR / "equity_curve.parquet"
 
-    existing = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=["date", "equity"])
-    existing["date"] = pd.to_datetime(existing["date"]).dt.date
+    if out_path.exists():
+        try:
+            existing = pd.read_parquet(out_path)
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"equity_curve.parquet unreadable ({exc}); starting fresh.")
+            existing = pd.DataFrame(columns=["date", "equity"])
+    else:
+        existing = pd.DataFrame(columns=["date", "equity"])
+
+    # Use pd.Timestamp for consistent date handling
+    as_of_ts = pd.Timestamp(as_of)
+    existing["date"] = pd.to_datetime(existing["date"])
 
     # Remove any existing row for this date (so we always have the latest value)
-    existing = existing[existing["date"] != as_of]
+    existing = existing[existing["date"] != as_of_ts]
 
-    new_row = pd.DataFrame([{"date": as_of, "equity": account_value}])
-    combined = pd.concat([existing, new_row], ignore_index=True).sort_values("date")
+    new_row = pd.DataFrame([{"date": as_of_ts, "equity": account_value}])
+    combined = pd.concat([existing, new_row], ignore_index=True).sort_values("date").reset_index(drop=True)
 
     combined.to_parquet(out_path, index=False)
 
