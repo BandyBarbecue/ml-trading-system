@@ -22,6 +22,8 @@ from datetime import datetime
 FEATURE_COLS = [
     "mom_1m", "mom_3m", "mom_12m", "rev_1w",
     "vol_20d", "news_score", "supply_chain_score", "sue",
+    "gross_profitability", "pb_ratio",
+    "revision_momentum", "insider_score",
 ]
 
 
@@ -50,11 +52,26 @@ def train(
     lgb.LGBMRegressor
         The fitted model.
     """
-    # Drop rows where any feature or the target is missing — LightGBM can handle
-    # NaNs internally, but we want clean, intentional training data.
-    train_data = feature_matrix.dropna(subset=FEATURE_COLS + ["target"])
-    X = train_data[FEATURE_COLS]
+    # Use every feature column that exists and has at least some data.
+    # Features that are entirely NaN (e.g. news_score before news files exist)
+    # are excluded from the feature set entirely.
+    avail_features = [
+        c for c in FEATURE_COLS
+        if c in feature_matrix.columns and feature_matrix[c].notna().any()
+    ]
+    # Only drop rows where the TARGET is unknown — we can't train without knowing
+    # the outcome. Missing FEATURE values are filled with 0 (neutral signal) rather
+    # than dropping the row: news_score is legitimately 0 for dates with no news,
+    # and dropping those rows would reduce a 2-year training window to 3 days.
+    train_data = feature_matrix.dropna(subset=["target"])[avail_features + ["target"]].copy()
+    train_data[avail_features] = train_data[avail_features].fillna(0)
+    X = train_data[avail_features]
     y = train_data["target"]
+    if X.empty:
+        raise ValueError(
+            "No training rows remain after dropping rows without a target — "
+            f"available features: {avail_features}"
+        )
 
     # sample_weight: if the caller provided per-feature IC weights, translate them
     # into per-sample weights based on how "informative" each row's features are.
@@ -62,7 +79,7 @@ def train(
     sample_weight = None
     if feature_weights is not None:
         weights_array = np.array([
-            feature_weights.get(col, 1.0) for col in FEATURE_COLS
+            feature_weights.get(col, 1.0) for col in avail_features
         ])
         # Clip to avoid zero or negative weights from bad IC values
         weights_array = np.clip(weights_array, 1e-3, None)
@@ -118,13 +135,23 @@ def predict(model: lgb.LGBMRegressor, feature_matrix: pd.DataFrame) -> pd.Series
     pd.Series
         Index = ticker symbols, values = predicted scores in [0, 1].
     """
-    # Only use features the model was trained on that are present in the input.
-    # This guards against calling predict on data that lacks some features.
-    avail = [c for c in FEATURE_COLS if c in feature_matrix.columns]
-    X = feature_matrix[avail].fillna(0)  # 0 = "no signal" for missing features
+    # When the feature matrix spans multiple dates (the full training history),
+    # score only the most recent date.  build_portfolio expects one score per
+    # unique ticker — not one per (date, ticker) pair.
+    fm = feature_matrix
+    if "date" in fm.columns and fm["date"].nunique() > 1:
+        fm = fm[fm["date"] == fm["date"].max()]
+
+    # Use the exact feature list the model was trained with.
+    # model.feature_name_ records which columns were present at fit time — this
+    # handles the case where not all FEATURE_COLS had data when training ran.
+    train_cols = getattr(model, "feature_name_", FEATURE_COLS)
+    # reindex selects the right columns in the right order; fillna(0) treats any
+    # missing column as "no signal" rather than crashing.
+    X = fm.reindex(columns=train_cols).fillna(0)
     raw_scores = model.predict(X)
     return (
-        pd.Series(raw_scores, index=feature_matrix["ticker"].values, name="predicted_score")
+        pd.Series(raw_scores, index=fm["ticker"].values, name="predicted_score")
         .clip(0, 1)
     )
 
