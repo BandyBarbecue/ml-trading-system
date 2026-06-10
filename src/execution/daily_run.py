@@ -409,7 +409,10 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
 
             engine        = RiskEngine()
             account_value = _get_account_value()
-            peak_value    = account_value  # simplified: no persistence of peak yet
+            from src.execution.risk_state   import get_peak_value
+            from src.execution.equity_tracker import update_equity
+            update_equity(account_value)
+            peak_value = get_peak_value(account_value)
 
             adjusted_weights, decisions = engine.check(
                 weights,
