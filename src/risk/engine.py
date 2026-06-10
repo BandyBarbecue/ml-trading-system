@@ -177,11 +177,24 @@ class RiskEngine:
                 }))
 
         # ----------------------------------------------------------
-        # 6. Re-normalise — surviving weights should sum to 1.0
-        #    (skip if kill switch fired — all zeros, nothing to normalise)
+        # 6. Re-normalise (long-only only)
+        #    For long-only portfolios, weights should sum to 1.0, so we
+        #    divide by the total to restore that invariant after clipping.
+        #
+        #    For long-short portfolios we must NOT do this.  In a mixed
+        #    long/short book, weights.sum() equals (long exposure - short
+        #    exposure) which is the *net* exposure, not the gross.  Dividing
+        #    by a net < 1 inflates every absolute weight and can push gross
+        #    exposure above GROSS_EXPOSURE_CAP, defeating step 5.
+        #
+        #    Example: 120% long + 30% short → sum = 0.90, gross = 1.50.
+        #    Dividing by 0.90 → gross becomes 1.667, exceeding a 1.60 cap.
+        #
+        #    The gross-exposure cap in step 5 already handles scaling for
+        #    long-short portfolios, so no further normalisation is needed.
         # ----------------------------------------------------------
-        if not kill_switch_fired:
-            total = weights.sum()
+        if not kill_switch_fired and not config.LONG_SHORT_ENABLED:
+            total = float(weights.sum())
             if total > 0.0:
                 weights = weights / total
 
