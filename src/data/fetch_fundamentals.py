@@ -46,6 +46,18 @@ def update_fundamentals(symbols: list[str] | None = None) -> None:
         symbols = get_symbols()
 
     today = date.today().isoformat()
+
+    # Skip the entire fetch if we already have today's data for all symbols.
+    # yfinance takes ~5 minutes for 500 tickers — no need to repeat intraday.
+    out_path: Path = config.FUNDAMENTALS_FILE
+    if out_path.exists():
+        existing = pd.read_parquet(out_path)
+        already_today = set(existing.loc[existing["date"] == today, "ticker"])
+        symbols = [s for s in symbols if s not in already_today]
+        if not symbols:
+            log.info("fundamentals: all tickers already fetched today — skipping.")
+            return
+
     records = []
 
     for i, ticker in enumerate(symbols):
@@ -73,7 +85,6 @@ def update_fundamentals(symbols: list[str] | None = None) -> None:
 
     new_df = pd.DataFrame(records)
 
-    out_path: Path = config.FUNDAMENTALS_FILE
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists():
