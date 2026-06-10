@@ -14,6 +14,17 @@ PRICES_DIR    = DATA_DIR / "prices"      # one parquet per symbol
 INTRADAY_DIR  = DATA_DIR / "intraday"   # ticker/YYYY-MM-DD.parquet
 NEWS_DIR      = DATA_DIR / "news"        # YYYY-MM-DD.parquet
 EARNINGS_FILE = DATA_DIR / "earnings" / "earnings.parquet"
+FUNDAMENTALS_FILE = DATA_DIR / "fundamentals" / "fundamentals.parquet"
+INSIDER_FILE      = DATA_DIR / "insider"       / "insider.parquet"
+REGIME_FILE       = DATA_DIR / "features"      / "regime.parquet"
+FRED_BASE_URL     = "https://api.stlouisfed.gov/fred/series/observations"
+FRED_API_KEY      = os.getenv("FRED_API_KEY", "")
+
+# Long-short extension — disabled by default until backtest confirms positive IC
+LONG_SHORT_ENABLED  = False
+N_SHORT_POSITIONS   = 25
+MAX_SHORT_PCT       = 0.03   # 3% max per short position
+GROSS_EXPOSURE_CAP  = 1.60   # long + |short| <= 160% of NAV
 FEATURES_DIR  = DATA_DIR / "features"
 MODELS_DIR    = DATA_DIR / "models"
 ATTR_DIR      = DATA_DIR / "attribution"
