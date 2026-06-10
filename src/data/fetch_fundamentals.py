@@ -59,6 +59,11 @@ def update_fundamentals(symbols: list[str] | None = None) -> None:
                     "gross_profitability": snap.get("grossProfitMargin"),
                     "pb_ratio":            snap.get("priceToBookRatio"),
                 })
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code in (401, 403):
+                log.error("FMP API authentication failed — aborting. Check FMP_API_KEY.")
+                return  # abort entire update
+            log.warning("fundamentals HTTP error for %s: %s", sym, exc)
         except Exception as exc:
             log.warning("fundamentals fetch failed for %s: %s", sym, exc)
 
@@ -67,7 +72,7 @@ def update_fundamentals(symbols: list[str] | None = None) -> None:
 
     new_df = pd.DataFrame(rows)
     combined = pd.concat([existing, new_df], ignore_index=True).drop_duplicates(
-        subset=["ticker", "date"]
+        subset=["ticker", "date"], keep="last"
     )
     combined.to_parquet(out_path, index=False)
     log.info("Fundamentals: wrote %d rows to %s", len(combined), out_path)
