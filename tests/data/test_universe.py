@@ -21,10 +21,10 @@ def test_get_symbols_returns_list(tmp_path, monkeypatch):
 def test_brk_dot_replaced(tmp_path, monkeypatch):
     monkeypatch.setattr("src.data.sp500_universe.UNIVERSE_FILE", tmp_path / "sp500.csv")
     with patch("src.data.sp500_universe.pd.read_html", return_value=[MOCK_DF]):
-        symbols = get_symbols()
-    # BRK.B -> BRK-B (Alpaca uses hyphens)
-    assert "BRK-B" in symbols
-    assert "BRK.B" not in symbols
+        df = load_sp500_tickers()
+    # BRK.B -> BRK-B (Alpaca uses hyphens, not dots)
+    assert "BRK-B" in df["ticker"].values
+    assert "BRK.B" not in df["ticker"].values
 
 def test_csv_written(tmp_path, monkeypatch):
     csv_path = tmp_path / "sp500.csv"

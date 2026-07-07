@@ -1,0 +1,28 @@
+<h2>How large should the trading universe be?</h2>
+<p class="subtitle">More stocks = more data, more diversification, more ML signal — but more complexity and storage.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Curated ~20–50 stocks</h3>
+      <p>Hand-picked high-liquidity names: mega-caps, sector ETFs. Manageable. Each stock gets deep news coverage. Good for learning. Limited cross-sectional diversity.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>S&P 500 (~500 stocks)</h3>
+      <p>The professional standard. Enough stocks to rank cross-sectionally, diversify, and find real signal. News coverage is broad. Data is 5–10× heavier. This is where quant strategies come alive.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Multi-asset (stocks + crypto + ETFs)</h3>
+      <p>Diversify across asset classes. Crypto adds 24/7 data and high volatility. Harder to build a unified model — different regimes, different liquidity. More complex, but interesting.</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:1.5rem; font-size:0.85rem">My recommendation: S&P 500. It's the sweet spot — large enough for cross-sectional ML, liquid enough that news actually moves prices, and well-studied enough that you can validate your results against academic benchmarks.</p>

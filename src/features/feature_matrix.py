@@ -26,12 +26,15 @@ NaN target:
   the model should never be trained on rows where the target is unknown.
 """
 
+import logging
 import sys
 from pathlib import Path
 
 import pandas as pd
 import numpy as np
 from config import PRICES_DIR, TARGET_HORIZON
+
+log = logging.getLogger(__name__)
 
 
 def build_feature_matrix(
@@ -118,8 +121,13 @@ def build_feature_matrix(
     target = fwd_ret.rank(axis=1, pct=True)
 
     # --- 5. Melt into tidy long format ---
+    # This loop is the slow part: ~529 dates × 500 tickers = ~264k iterations.
+    # Pure Python + per-cell .loc[] is not fast, but it's easy to follow.
     rows: list[dict] = []
-    for date in dates:
+    n_dates = len(dates)
+    for i, date in enumerate(dates):
+        if i > 0 and i % 100 == 0:
+            log.info("feature matrix: %d/%d dates assembled", i, n_dates)
         if date not in price_feats.index:
             # This date has no price features (e.g. before warm-up period ends).
             continue

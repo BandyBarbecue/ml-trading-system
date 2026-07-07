@@ -1,0 +1,79 @@
+<h2>Section 5: Portfolio Construction</h2>
+<p class="subtitle">From 25 scored stocks to actual position sizes. HRP ensures you're genuinely diversified — not just spread across 25 stocks that all move together.</p>
+
+<div class="section" style="background:#1a1f2e; border:1px solid #2a3550; border-radius:8px; padding:14px; margin-bottom:1.2rem">
+  <h3 style="margin-top:0; color:#6b8cff">Why not just equal-weight the top 25?</h3>
+  <p style="color:#8899bb; font-size:0.84rem">If your top 25 includes AAPL, MSFT, NVDA, META, GOOGL, AMZN — that's 6 mega-cap tech stocks all moving together. Equal weight gives them 24% of the portfolio. When tech sells off, you take 6 simultaneous hits. HRP sees that these stocks are a correlated cluster and treats the whole cluster as one allocation unit, capping the damage.</p>
+  <p style="color:#8899bb; font-size:0.84rem">Analogy: you wouldn't call a portfolio "diversified" just because it has 25 lines — not if 15 of those lines are different flavours of the same bet.</p>
+</div>
+
+<div class="section">
+  <h3>How HRP works — four steps</h3>
+  <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:8px; font-size:0.82rem; margin-top:0.8rem">
+    <div style="background:#181828; border:1px solid #2a2a40; border-radius:6px; padding:10px">
+      <div class="label" style="color:#6b8cff">STEP 1</div>
+      <p style="color:#e8eaf0; margin:4px 0"><strong>Correlation matrix</strong></p>
+      <p style="color:#7a8aaa; margin:0">60-day rolling returns of your 25 stocks. Which pairs move together?</p>
+      <div style="margin-top:8px; font-family:monospace; font-size:0.75rem; color:#5a6a8a">
+        AAPL–MSFT: 0.82<br>
+        AAPL–JPM: 0.31<br>
+        AAPL–XOM: 0.18
+      </div>
+    </div>
+    <div style="background:#181828; border:1px solid #2a2a40; border-radius:6px; padding:10px">
+      <div class="label" style="color:#6b8cff">STEP 2</div>
+      <p style="color:#e8eaf0; margin:4px 0"><strong>Cluster similar stocks</strong></p>
+      <p style="color:#7a8aaa; margin:0">Hierarchical clustering groups correlated stocks. Tech forms one cluster. Financials another. Healthcare another.</p>
+      <div style="margin-top:8px; font-size:0.75rem; color:#5a6a8a">
+        [AAPL MSFT NVDA META]<br>
+        &nbsp;&nbsp;↕ tech cluster<br>
+        [JPM GS BAC]<br>
+        &nbsp;&nbsp;↕ finance cluster<br>
+        [JNJ PFE MRK]
+      </div>
+    </div>
+    <div style="background:#181828; border:1px solid #2a2a40; border-radius:6px; padding:10px">
+      <div class="label" style="color:#6b8cff">STEP 3</div>
+      <p style="color:#e8eaf0; margin:4px 0"><strong>Recursive bisection</strong></p>
+      <p style="color:#7a8aaa; margin:0">Split into two halves. Allocate inversely proportional to each half's variance. Recurse within each half.</p>
+      <div style="margin-top:8px; font-size:0.75rem; color:#5a6a8a">
+        Tech cluster (high vol)<br>
+        → gets less weight<br><br>
+        Healthcare cluster (low vol)<br>
+        → gets more weight
+      </div>
+    </div>
+    <div style="background:#181828; border:1px solid #2a2a40; border-radius:6px; padding:10px">
+      <div class="label" style="color:#6b8cff">STEP 4</div>
+      <p style="color:#e8eaf0; margin:4px 0"><strong>Final weights</strong></p>
+      <p style="color:#7a8aaa; margin:0">Weights sum to 1. Each cluster gets fair representation regardless of how many stocks are in it.</p>
+      <div style="margin-top:8px; font-size:0.75rem; color:#5a6a8a">
+        AAPL: 4.2%<br>
+        MSFT: 3.9%<br>
+        JPM: 6.1%<br>
+        JNJ: 7.3%<br>
+        <span style="color:#4caf6f">∑ = 100%</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:1.5rem; display:grid; grid-template-columns:1fr 1fr; gap:12px">
+  <div style="background:#1a201a; border:1px solid #2a4030; border-radius:8px; padding:14px">
+    <h3 style="margin-top:0; color:#4caf6f">Sector hard cap</h3>
+    <p style="color:#8899bb; font-size:0.83rem">Even after HRP, if any GICS sector exceeds <strong>30% of portfolio value</strong>, we scale those positions down proportionally and redistribute the freed weight. This prevents concentrated sector bets even when the ML strongly favours one industry.</p>
+    <p style="color:#8899bb; font-size:0.83rem">Example: HRP gives tech 38% → cap to 30% → 8% redistributed to other sectors pro-rata.</p>
+  </div>
+  <div style="background:#1f1a18; border:1px solid #403020; border-radius:8px; padding:14px">
+    <h3 style="margin-top:0; color:#d4b04a">Weekly rebalance</h3>
+    <p style="color:#8899bb; font-size:0.83rem">Every Monday before open: re-run ML predictions → re-run HRP → compare to current holdings → generate trade list. <strong>Turnover cap: 40% of portfolio per rebalance.</strong></p>
+    <p style="color:#8899bb; font-size:0.83rem">If the optimal portfolio requires 60% turnover, we execute only the highest-priority trades first (biggest position changes). This keeps transaction costs realistic.</p>
+  </div>
+</div>
+
+<div style="background:#181818; border:1px solid #303030; border-radius:6px; padding:12px; margin-top:1.2rem; font-size:0.82rem">
+  <div class="label" style="color:#888">OUTPUT OF THIS LAYER</div>
+  <p style="color:#b0c0d0; margin:4px 0">A dictionary of <code>{ticker: target_weight}</code> — e.g. <code>{"AAPL": 0.042, "JPM": 0.061, ...}</code>. Passed to the risk engine for final veto before orders are placed.</p>
+</div>
+
+<p class="subtitle" style="font-size:0.85rem; margin-top:1.2rem">Does this portfolio construction approach make sense?</p>

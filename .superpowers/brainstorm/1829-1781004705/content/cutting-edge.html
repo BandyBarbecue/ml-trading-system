@@ -1,0 +1,74 @@
+<h2>Cutting edge: what's real vs what's hype</h2>
+<p class="subtitle">The architecture is already close to what AQR and Two Sigma use at their core. One upgrade makes it genuinely state-of-the-art in 2026.</p>
+
+<div class="section">
+  <h3 style="color:#4caf6f">✓ Already cutting edge</h3>
+  <table style="width:100%; font-size:0.85rem; border-collapse:collapse">
+    <tr style="border-bottom:1px solid #2a3550">
+      <td style="padding:8px; color:#b0c0e0; width:30%"><strong>Cross-sectional ML on factors</strong></td>
+      <td style="padding:8px; color:#7a8aaa">Ranking stocks against each other (not predicting raw prices) is exactly the AQR / Renaissance approach. Much more robust than price prediction.</td>
+    </tr>
+    <tr style="border-bottom:1px solid #2a3550">
+      <td style="padding:8px; color:#b0c0e0"><strong>LightGBM on tabular features</strong></td>
+      <td style="padding:8px; color:#7a8aaa">In 2026, gradient boosting still beats deep learning on tabular financial data. This is well-established. Don't let anyone sell you a transformer for this.</td>
+    </tr>
+    <tr style="border-bottom:1px solid #2a3550">
+      <td style="padding:8px; color:#b0c0e0"><strong>Walk-forward validation</strong></td>
+      <td style="padding:8px; color:#7a8aaa">The correct way to validate any strategy. Most "AI trading" projects skip this and overfit. You won't.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px; color:#b0c0e0"><strong>Post-earnings drift signal</strong></td>
+      <td style="padding:8px; color:#7a8aaa">One of the most persistent market anomalies. Still works. Used by every serious quant fund.</td>
+    </tr>
+  </table>
+</div>
+
+<div class="section" style="margin-top:1.5rem; background:#1f1a2e; border:1px solid #3a2a50; border-radius:8px; padding:16px">
+  <h3 style="color:#b06bff; margin-top:0">⭐ The upgrade that makes it state-of-the-art: swap FinBERT for Claude</h3>
+  <p style="color:#8899bb; font-size:0.85rem">You already have an <strong>Anthropic API key in your .env</strong>. FinBERT gives you one of three outputs: bullish / bearish / neutral. That's a blunt instrument. Here's what Claude gives you instead:</p>
+
+  <div class="split" style="margin-top:1rem">
+    <div class="mockup">
+      <div class="mockup-header">FinBERT output</div>
+      <div class="mockup-body" style="font-family:monospace; font-size:0.8rem; color:#7a8aaa">
+        <p>"Apple beats Q3 earnings by 8%"</p>
+        <p>→ sentiment: <span style="color:#4caf6f">POSITIVE</span></p>
+        <p>→ score: 0.91</p>
+        <br>
+        <p><em>That's it. No context.</em></p>
+      </div>
+    </div>
+    <div class="mockup">
+      <div class="mockup-header">Claude structured extraction</div>
+      <div class="mockup-body" style="font-family:monospace; font-size:0.78rem; color:#7a8aaa">
+        <p style="color:#b06bff">{</p>
+        <p>&nbsp;"event_type": "earnings_beat",</p>
+        <p>&nbsp;"primary_ticker": "AAPL",</p>
+        <p>&nbsp;"affected_tickers": ["TSMC","QCOM"],</p>
+        <p>&nbsp;"magnitude": "large",</p>
+        <p>&nbsp;"time_horizon": "1-4 weeks",</p>
+        <p>&nbsp;"confidence": 0.87,</p>
+        <p>&nbsp;"reasoning": "Beat driven by services margin..."</p>
+        <p style="color:#b06bff">}</p>
+      </div>
+    </div>
+  </div>
+
+  <p style="color:#8899bb; font-size:0.85rem; margin-top:1rem">This is what quant hedge funds with LLM access are doing right now. The <strong>affected_tickers</strong> field is the killer feature — Apple earnings affect TSMC and Qualcomm as suppliers. FinBERT can't see that. Claude can.</p>
+</div>
+
+<div class="section" style="margin-top:1.5rem; background:#18201a; border:1px solid #2a4030; border-radius:8px; padding:16px">
+  <h3 style="color:#4caf6f; margin-top:0">Two more upgrades worth adding</h3>
+  <table style="width:100%; font-size:0.85rem; border-collapse:collapse">
+    <tr style="border-bottom:1px solid #2a3550">
+      <td style="padding:8px; color:#b0c0e0; width:30%"><strong>Dynamic factor weights</strong></td>
+      <td style="padding:8px; color:#7a8aaa">Track each factor's Information Coefficient (IC) — how predictive has momentum been in the last 60 days? Reweight LightGBM inputs accordingly. The model adapts when regimes shift.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px; color:#b0c0e0"><strong>Hierarchical Risk Parity sizing</strong></td>
+      <td style="padding:8px; color:#7a8aaa">More sophisticated than inverse-vol. Considers correlations between your 25 positions — doesn't let 10 tech stocks dominate just because they have similar vol. Ray Dalio's approach.</td>
+    </tr>
+  </table>
+</div>
+
+<p class="subtitle" style="margin-top:1.5rem; font-size:0.85rem">Want to include all three upgrades (Claude NLP, dynamic factor weights, HRP sizing)? They're all achievable in your timeline and they're what separates a serious system from a textbook one.</p>

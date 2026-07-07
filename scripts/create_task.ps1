@@ -9,13 +9,15 @@
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $RunScript   = Join-Path $ScriptDir "schedule_daily.ps1"
-$TaskName    = "TradingAlgorithm_DailyRun"
+$TaskName    = "TradingSystem-DailyRun"
 
-# Unregister existing task if it exists (clean re-registration)
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    Write-Host "Removed existing task: $TaskName"
+# Remove any existing versions of this task (including the old name)
+foreach ($name in @($TaskName, "TradingAlgorithm_DailyRun")) {
+    $existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if ($existing) {
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false
+        Write-Host "Removed existing task: $name"
+    }
 }
 
 $action  = New-ScheduledTaskAction `

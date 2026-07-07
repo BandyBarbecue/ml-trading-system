@@ -1,0 +1,66 @@
+<h2>Section 2: Data Pipeline</h2>
+<p class="subtitle">Four data sources, all free, two already wired up. Each feeds a different part of the feature layer.</p>
+
+<div class="section">
+  <table style="width:100%; border-collapse:separate; border-spacing:6px; font-size:0.84rem">
+    <tr>
+      <th style="text-align:left; padding:8px; color:#6b8cff; font-size:0.75rem; text-transform:uppercase">Source</th>
+      <th style="text-align:left; padding:8px; color:#6b8cff; font-size:0.75rem; text-transform:uppercase">What we fetch</th>
+      <th style="text-align:left; padding:8px; color:#6b8cff; font-size:0.75rem; text-transform:uppercase">Frequency</th>
+      <th style="text-align:left; padding:8px; color:#6b8cff; font-size:0.75rem; text-transform:uppercase">Stored as</th>
+      <th style="text-align:left; padding:8px; color:#6b8cff; font-size:0.75rem; text-transform:uppercase">Status</th>
+    </tr>
+    <tr style="background:#1a1f2e">
+      <td style="padding:10px; color:#e8eaf0; border-radius:4px"><strong>Alpaca Historical</strong></td>
+      <td style="padding:10px; color:#8899bb">OHLCV daily bars, 5yr, S&P 500 (500 symbols). Adjusted for splits + dividends.</td>
+      <td style="padding:10px; color:#8899bb">Daily top-up (append yesterday's bar)</td>
+      <td style="padding:10px; color:#8899bb"><code>data/prices/AAPL.parquet</code> — one file per symbol. Parquet replaces CSV: 10× faster reads on 500 files.</td>
+      <td style="padding:10px; color:#4caf6f">✓ Extend existing</td>
+    </tr>
+    <tr style="background:#1a1f2e">
+      <td style="padding:10px; color:#e8eaf0; border-radius:4px"><strong>Alpaca News API</strong></td>
+      <td style="padding:10px; color:#8899bb">Headlines + body snippets per ticker. Rolling 90-day window. Same API key, already authenticated.</td>
+      <td style="padding:10px; color:#8899bb">Daily (fetch overnight news before market open)</td>
+      <td style="padding:10px; color:#8899bb"><code>data/news/YYYY-MM-DD.parquet</code> — one file per day, all tickers. Columns: ticker, headline, url, published_at, source.</td>
+      <td style="padding:10px; color:#b06bff">✦ New</td>
+    </tr>
+    <tr style="background:#1a1f2e">
+      <td style="padding:10px; color:#e8eaf0; border-radius:4px"><strong>FMP API</strong></td>
+      <td style="padding:10px; color:#8899bb">Quarterly EPS actuals vs analyst estimates. Free tier: 250 calls/day — enough for quarterly updates.</td>
+      <td style="padding:10px; color:#8899bb">Quarterly refresh (after earnings season ends). Cached locally.</td>
+      <td style="padding:10px; color:#8899bb"><code>data/earnings/earnings.parquet</code> — all tickers, all quarters. Columns: ticker, date, actual_eps, estimated_eps, surprise_pct.</td>
+      <td style="padding:10px; color:#b06bff">✦ New</td>
+    </tr>
+    <tr style="background:#1a1f2e">
+      <td style="padding:10px; color:#e8eaf0; border-radius:4px"><strong>yfinance (VIX)</strong></td>
+      <td style="padding:10px; color:#8899bb">^VIX daily close. Used by the regime filter in the risk engine. No API key needed.</td>
+      <td style="padding:10px; color:#8899bb">Daily top-up</td>
+      <td style="padding:10px; color:#8899bb"><code>data/vix.parquet</code> — single file, date-indexed.</td>
+      <td style="padding:10px; color:#b06bff">✦ New</td>
+    </tr>
+    <tr style="background:#1a1f2e">
+      <td style="padding:10px; color:#e8eaf0; border-radius:4px"><strong>S&P 500 list</strong></td>
+      <td style="padding:10px; color:#8899bb">Current constituent tickers + GICS sectors. Scraped from Wikipedia. Updated quarterly to handle additions/removals.</td>
+      <td style="padding:10px; color:#8899bb">Quarterly</td>
+      <td style="padding:10px; color:#8899bb"><code>data/sp500_tickers.csv</code> — ticker, company name, sector, sub-industry.</td>
+      <td style="padding:10px; color:#b06bff">✦ New</td>
+    </tr>
+  </table>
+</div>
+
+<div class="section" style="margin-top:1.5rem; background:#181820; border:1px solid #2a3040; border-radius:8px; padding:14px">
+  <h3 style="margin-top:0; color:#e8eaf0">New directory layout</h3>
+  <pre style="color:#7a9aaa; font-size:0.8rem; margin:0; line-height:1.6">src/data/
+  ├── fetch_prices.py       ← replaces fetch_data.py (handles 500 symbols, outputs parquet)
+  ├── fetch_news.py         ← Alpaca News API
+  ├── fetch_earnings.py     ← FMP API
+  ├── fetch_vix.py          ← yfinance
+  └── sp500_universe.py     ← scrapes + caches the S&P 500 constituent list</pre>
+</div>
+
+<div class="section" style="margin-top:1.2rem">
+  <h3>One important design decision: parquet over CSV</h3>
+  <p style="color:#8899bb; font-size:0.85rem">At 500 symbols × 5 years × daily bars, CSV reads become slow and wasteful. Parquet is a columnar binary format — reads are ~10× faster and files are ~5× smaller. Python's <code>pandas.read_parquet()</code> works identically to <code>read_csv()</code>. The existing CSV files in <code>data/</code> get replaced on the first run of the new ingestion script.</p>
+</div>
+
+<p class="subtitle" style="font-size:0.85rem">Does this data layer look right? Any sources you'd want to add or swap out?</p>

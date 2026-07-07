@@ -1,0 +1,74 @@
+<h2>Section 3: Feature Engineering</h2>
+<p class="subtitle">Six signals, computed daily for all 500 stocks. Everything is cross-sectionally normalised before entering the model.</p>
+
+<div class="section">
+  <h3>Price-based signals <span style="color:#5a6a8a; font-weight:normal; font-size:0.85rem">(from Alpaca OHLCV)</span></h3>
+  <table style="width:100%; border-collapse:collapse; font-size:0.84rem">
+    <tr style="border-bottom:1px solid #2a3040">
+      <td style="padding:9px; color:#b0c8e0; width:22%"><strong>Momentum 1m / 3m / 12m</strong></td>
+      <td style="padding:9px; color:#7a8aaa">Return over 21 / 63 / 252 days, but <em>skip the last 5 trading days</em>. The skip prevents short-term reversal from contaminating momentum — a well-known artefact. Academic name: Jegadeesh-Titman momentum.</td>
+    </tr>
+    <tr style="border-bottom:1px solid #2a3040">
+      <td style="padding:9px; color:#b0c8e0"><strong>Mean Reversion 1w</strong></td>
+      <td style="padding:9px; color:#7a8aaa">Negative of the 5-day return. Stocks that dropped sharply last week tend to bounce; those that rallied tend to cool off. Opposite sign to momentum — they capture different time horizons.</td>
+    </tr>
+    <tr>
+      <td style="padding:9px; color:#b0c8e0"><strong>Realised Vol 20d</strong></td>
+      <td style="padding:9px; color:#7a8aaa">Standard deviation of daily returns over 20 days. Used two ways: as a feature itself (low-vol stocks historically outperform) and as the denominator in HRP position sizing.</td>
+    </tr>
+  </table>
+</div>
+
+<div class="section" style="margin-top:1.5rem; background:#1f1a2e; border:1px solid #3a2a50; border-radius:8px; padding:14px">
+  <h3 style="color:#b06bff; margin-top:0">⭐ Claude NLP Pipeline — the cutting-edge part</h3>
+  <p style="color:#8899bb; font-size:0.84rem">Run once per day before market open. Processes overnight headlines in batches of 20 to stay within API rate limits.</p>
+
+  <div style="display:grid; grid-template-columns:1fr 40px 1fr 40px 1fr; gap:4px; align-items:center; margin-top:1rem; font-size:0.82rem">
+    <div style="background:#181828; border:1px solid #3a2a50; border-radius:6px; padding:10px">
+      <div class="label" style="color:#b06bff">STEP 1</div>
+      <p style="color:#e8eaf0; margin:4px 0"><strong>Fetch headlines</strong></p>
+      <p style="color:#7a8aaa; margin:0">Alpaca News API → last 24h of headlines per ticker. Deduplicated. ~500–2000 headlines/day across 500 stocks.</p>
+    </div>
+    <div style="text-align:center; color:#3a2a50; font-size:1.4rem">→</div>
+    <div style="background:#181828; border:1px solid #3a2a50; border-radius:6px; padding:10px">
+      <div class="label" style="color:#b06bff">STEP 2</div>
+      <p style="color:#e8eaf0; margin:4px 0"><strong>Claude extraction</strong></p>
+      <p style="color:#7a8aaa; margin:0">Structured prompt: extract event_type, primary_ticker, affected_tickers, magnitude, time_horizon, confidence. Returns JSON.</p>
+    </div>
+    <div style="text-align:center; color:#3a2a50; font-size:1.4rem">→</div>
+    <div style="background:#181828; border:1px solid #3a2a50; border-radius:6px; padding:10px">
+      <div class="label" style="color:#b06bff">STEP 3</div>
+      <p style="color:#e8eaf0; margin:4px 0"><strong>Score aggregation</strong></p>
+      <p style="color:#7a8aaa; margin:0">Aggregate to one score per ticker per day. Recent headlines weighted 2× older ones. Propagate to supply-chain tickers.</p>
+    </div>
+  </div>
+
+  <div style="margin-top:1.2rem; background:#141420; border-radius:6px; padding:12px; font-family:monospace; font-size:0.78rem; color:#7a8aaa">
+    <div style="color:#b06bff; margin-bottom:6px"># Claude prompt template (simplified)</div>
+    <div>Given this financial headline, extract a structured signal:</div>
+    <div style="color:#5a8a5a; margin:4px 0">"Apple reports Q3 EPS of $1.53, beating consensus of $1.40 by 9%"</div>
+    <div style="margin-top:6px">Return JSON with: event_type, primary_ticker, affected_tickers,</div>
+    <div>magnitude (small/medium/large), direction (bullish/bearish/neutral),</div>
+    <div>time_horizon (intraday/1week/1month/quarter), confidence (0–1)</div>
+    <div style="color:#b06bff; margin-top:8px"># Output:</div>
+    <div>{"event_type": "earnings_beat", "primary_ticker": "AAPL",</div>
+    <div>&nbsp;"affected_tickers": [{"ticker":"TSMC","direction":"bullish","reason":"supplier"},</div>
+    <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{"ticker":"GOOGL","direction":"neutral","reason":"peer"}],</div>
+    <div>&nbsp;"magnitude": "large", "direction": "bullish",</div>
+    <div>&nbsp;"time_horizon": "1month", "confidence": 0.91}</div>
+  </div>
+
+  <p style="color:#8899bb; font-size:0.82rem; margin-top:1rem">Cost estimate: ~500 headlines/day × ~200 tokens each = ~100k tokens/day ≈ <strong>$0.30/day</strong> at Haiku 4.5 pricing. Affordable for a research system.</p>
+</div>
+
+<div class="section" style="margin-top:1.5rem">
+  <h3>Earnings Surprise <span style="color:#5a6a8a; font-weight:normal; font-size:0.85rem">(from FMP)</span></h3>
+  <p style="color:#8899bb; font-size:0.84rem">Standardised Unexpected Earnings (SUE): <code>(actual_EPS − estimated_EPS) / std(last_8_surprises)</code>. Standardising prevents a high-SUE stock from dominating just because its EPS is volatile. The signal decays over 60 days — a big beat from last quarter still carries some weight today, just less.</p>
+</div>
+
+<div class="section" style="margin-top:1.5rem; background:#18201a; border:1px solid #2a4030; border-radius:8px; padding:14px">
+  <h3 style="color:#4caf6f; margin-top:0">Cross-sectional normalisation — why it matters</h3>
+  <p style="color:#8899bb; font-size:0.84rem">Every feature is z-scored <em>within the S&P 500 on each day</em> before entering the model. Analogy: instead of asking "did Apple go up 5%?", we ask "was Apple in the top 20% of all stocks today?" This removes market-wide moves (everything goes up in a bull market) and makes the model rank stocks <em>against each other</em> — which is what we actually want. It also makes the model robust across different market regimes.</p>
+</div>
+
+<p class="subtitle" style="font-size:0.85rem; margin-top:1.2rem">Does this feature set look right? Anything you'd add or question?</p>

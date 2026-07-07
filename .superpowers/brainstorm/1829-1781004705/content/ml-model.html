@@ -1,0 +1,90 @@
+<h2>Section 4: ML Model</h2>
+<p class="subtitle">LightGBM learns which combination of your six signals predicts the top-performing stocks. Walk-forward keeps it honest. Dynamic IC weighting keeps it adaptive.</p>
+
+<div class="section" style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
+  <div style="background:#1a1f2e; border:1px solid #2a3550; border-radius:8px; padding:14px">
+    <h3 style="margin-top:0; color:#6b8cff">Why LightGBM?</h3>
+    <p style="color:#8899bb; font-size:0.83rem">Gradient boosting = an ensemble of decision trees where each new tree corrects the errors of the previous ones. Analogy: 100 junior analysts each specialising in different patterns, combining votes.</p>
+    <ul style="color:#8899bb; font-size:0.83rem; padding-left:1.2rem">
+      <li>Outperforms neural nets on tabular financial data (well-established)</li>
+      <li>Handles missing values natively — not every stock has earnings data every day</li>
+      <li>Feature importance built-in — you can see which signal contributed most</li>
+      <li>Trains in seconds on 500 stocks, easy to retrain monthly</li>
+    </ul>
+  </div>
+  <div style="background:#1f1a2e; border:1px solid #3a2a50; border-radius:8px; padding:14px">
+    <h3 style="margin-top:0; color:#b06bff">Target variable</h3>
+    <p style="color:#8899bb; font-size:0.83rem">The model predicts the <strong>20-day forward cross-sectional return rank</strong> — a number from 0 to 1 representing which percentile of the S&P 500 a stock will land in over the next month.</p>
+    <p style="color:#8899bb; font-size:0.83rem">Why ranks, not raw returns? Ranks are more stationary — the model learns "this pattern predicts being in the top 20%" rather than "this predicts +3.7%". Much more robust across different market conditions.</p>
+  </div>
+</div>
+
+<div class="section" style="margin-top:1.5rem">
+  <h3>Walk-forward training loop</h3>
+  <p style="color:#8899bb; font-size:0.84rem; margin-bottom:1rem">The key anti-overfitting mechanism. The model <em>never sees the future</em> during training.</p>
+
+  <div style="position:relative; padding:1rem 0">
+    <!-- Timeline bar -->
+    <div style="height:40px; background:#0f1520; border:1px solid #2a3550; border-radius:6px; position:relative; overflow:hidden; margin-bottom:8px">
+      <div style="position:absolute; left:0; width:40%; height:100%; background:#1a3050; border-right:2px solid #6b8cff; display:flex; align-items:center; justify-content:center">
+        <span style="color:#6b8cff; font-size:0.8rem; font-weight:bold">TRAIN (2 years rolling)</span>
+      </div>
+      <div style="position:absolute; left:40%; width:8%; height:100%; background:#2a1f40; border-right:2px solid #b06bff; display:flex; align-items:center; justify-content:center">
+        <span style="color:#b06bff; font-size:0.75rem">TEST 1m</span>
+      </div>
+      <div style="position:absolute; left:48%; right:0; height:100%; background:#0f1520; display:flex; align-items:center; justify-content:center">
+        <span style="color:#3a4560; font-size:0.78rem">→ step forward 1 month → repeat</span>
+      </div>
+    </div>
+
+    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:1rem; font-size:0.82rem">
+      <div style="background:#0f1520; border:1px solid #2a3040; border-radius:6px; padding:10px">
+        <div class="label" style="color:#6b8cff">BACKTEST CYCLE 1</div>
+        <p style="color:#8899bb; margin:4px 0">Train: 2019–2021<br>Test: Jan 2022<br>Record predictions</p>
+      </div>
+      <div style="background:#0f1520; border:1px solid #2a3040; border-radius:6px; padding:10px">
+        <div class="label" style="color:#6b8cff">BACKTEST CYCLE 2</div>
+        <p style="color:#8899bb; margin:4px 0">Train: 2019–2021 + Jan<br>Test: Feb 2022<br>Record predictions</p>
+      </div>
+      <div style="background:#0f1520; border:1px solid #2a3040; border-radius:6px; padding:10px">
+        <div class="label" style="color:#6b8cff">LIVE (today)</div>
+        <p style="color:#8899bb; margin:4px 0">Train: 2023–2025<br>Predict: June 2026<br>These are real signals</p>
+      </div>
+    </div>
+    <p style="color:#7a8aaa; font-size:0.82rem; margin-top:8px">With 5 years of data and a 2-year training window: ~3 years of out-of-sample backtest predictions. That's enough to validate through the 2022 bear market, the 2023 recovery, and the 2024–25 AI bull run.</p>
+  </div>
+</div>
+
+<div class="section" style="margin-top:1.5rem; background:#18201a; border:1px solid #2a4030; border-radius:8px; padding:14px">
+  <h3 style="color:#4caf6f; margin-top:0">Dynamic IC Weighting — how the model stays adaptive</h3>
+  <p style="color:#8899bb; font-size:0.84rem">IC = Information Coefficient = Spearman correlation between a feature's daily values and actual 20-day forward returns. A feature with IC = 0.05 is genuinely predictive. IC = 0 means noise. IC goes negative when a factor stops working.</p>
+
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:1rem; font-size:0.82rem">
+    <div style="background:#101810; border:1px solid #1a3020; border-radius:6px; padding:10px">
+      <div class="label" style="color:#4caf6f">NORMAL MARKET (2023–2024)</div>
+      <table style="width:100%; color:#7a9a7a; margin-top:4px">
+        <tr><td>Momentum 12m</td><td style="text-align:right; color:#4caf6f">IC 0.07 ↑↑</td></tr>
+        <tr><td>News sentiment</td><td style="text-align:right; color:#4caf6f">IC 0.05 ↑</td></tr>
+        <tr><td>Earnings surprise</td><td style="text-align:right; color:#4caf6f">IC 0.06 ↑</td></tr>
+        <tr><td>Mean reversion</td><td style="text-align:right; color:#888">IC 0.01 →</td></tr>
+      </table>
+    </div>
+    <div style="background:#101810; border:1px solid #1a3020; border-radius:6px; padding:10px">
+      <div class="label" style="color:#d4b04a">VOLATILE MARKET (2022 bear)</div>
+      <table style="width:100%; color:#7a9a7a; margin-top:4px">
+        <tr><td>Momentum 12m</td><td style="text-align:right; color:#ff6b6b">IC -0.03 ↓↓</td></tr>
+        <tr><td>News sentiment</td><td style="text-align:right; color:#4caf6f">IC 0.08 ↑↑</td></tr>
+        <tr><td>Earnings surprise</td><td style="text-align:right; color:#4caf6f">IC 0.05 ↑</td></tr>
+        <tr><td>Mean reversion</td><td style="text-align:right; color:#4caf6f">IC 0.06 ↑↑</td></tr>
+      </table>
+    </div>
+  </div>
+  <p style="color:#8899bb; font-size:0.83rem; margin-top:10px">Each month, before retraining, we compute 60-day rolling IC for all features. Features with higher recent IC get upweighted as LightGBM <code>feature_weight</code> inputs. The model automatically leans on what's been working lately — without any manual intervention.</p>
+</div>
+
+<div style="background:#181818; border:1px solid #303030; border-radius:6px; padding:12px; margin-top:1.2rem; font-size:0.82rem">
+  <div class="label" style="color:#888">OUTPUT OF THIS LAYER</div>
+  <p style="color:#b0c0d0; margin:4px 0">One <strong>predicted_score</strong> (0–1) for each of 500 stocks, refreshed daily. Top 25 by score are passed to the portfolio construction layer.</p>
+</div>
+
+<p class="subtitle" style="font-size:0.85rem; margin-top:1.2rem">Does this ML layer make sense? Happy to explain IC or walk-forward in more depth.</p>

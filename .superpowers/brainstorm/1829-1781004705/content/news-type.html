@@ -1,0 +1,28 @@
+<h2>What kind of news signal?</h2>
+<p class="subtitle">Each type requires different data sources and NLP approaches. You can combine later — pick your primary first.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>News headline sentiment</h3>
+      <p>NLP on financial headlines: "Apple beats earnings", "Fed raises rates", "CEO resigns". Classify each headline as bullish/bearish/neutral and score stocks daily. <strong>Source: Alpaca News API (you already have the key).</strong></p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Earnings surprises</h3>
+      <p>Did the company beat or miss analyst consensus EPS? Beat = bullish catalyst. Miss = bearish. Quantified, not fuzzy. Strong academic backing — post-earnings drift is one of the most persistent anomalies. <strong>Source: Financial Modeling Prep (free tier).</strong></p>
+    </div>
+  </div>
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Both — fused into one signal</h3>
+      <p>News sentiment + earnings surprise combined into a single "fundamental momentum" score. More robust than either alone. Slightly more complex pipeline. Recommended — the two signals are complementary and both free.</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:1.5rem; font-size:0.85rem">My recommendation: C. Headline sentiment catches intraday reactions; earnings surprise captures multi-week drift. Together they cover different time horizons of the same fundamental story.</p>

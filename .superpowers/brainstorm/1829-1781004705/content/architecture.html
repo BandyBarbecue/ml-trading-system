@@ -1,0 +1,69 @@
+<h2>System Architecture</h2>
+<p class="subtitle">Data flows left to right through five layers. Each layer has one job and talks to the next through a clean interface.</p>
+
+<div style="overflow-x:auto; padding: 1rem 0;">
+<table style="width:100%; border-collapse:separate; border-spacing:8px; font-size:0.88rem;">
+  <tr>
+    <td style="background:#1a1f2e; border:1px solid #2a3550; border-radius:8px; padding:14px; vertical-align:top; width:18%">
+      <div class="label" style="color:#6b8cff">LAYER 1</div>
+      <h3 style="margin:6px 0; color:#e8eaf0">Data Ingestion</h3>
+      <hr style="border-color:#2a3550; margin:8px 0">
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📈 <strong>Alpaca</strong><br>S&P 500 daily OHLCV<br>5-year history</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📰 <strong>Alpaca News</strong><br>Headlines per ticker<br>Rolling 30-day window</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📊 <strong>FMP API</strong><br>Earnings actuals<br>vs analyst estimates</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📋 <strong>Static list</strong><br>S&P 500 constituents<br>(updated quarterly)</p>
+    </td>
+    <td style="background:#1e2820; border:1px solid #2a4030; border-radius:8px; padding:14px; vertical-align:top; width:18%">
+      <div class="label" style="color:#4caf6f">LAYER 2</div>
+      <h3 style="margin:6px 0; color:#e8eaf0">Feature Engineering</h3>
+      <hr style="border-color:#2a4030; margin:8px 0">
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📐 <strong>Price momentum</strong><br>1m / 3m / 12m returns<br>(skip last week)</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🔄 <strong>Mean reversion</strong><br>5-day return reversal</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🧠 <strong>NLP sentiment</strong><br>FinBERT on headlines<br>→ daily score per ticker</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">💰 <strong>Earnings surprise</strong><br>(actual − est) / |est|<br>Post-earnings drift</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📏 <strong>Cross-sectional rank</strong><br>All features z-scored<br>within S&P 500 daily</p>
+    </td>
+    <td style="background:#1f1a2e; border:1px solid #3a2a50; border-radius:8px; padding:14px; vertical-align:top; width:18%">
+      <div class="label" style="color:#b06bff">LAYER 3</div>
+      <h3 style="margin:6px 0; color:#e8eaf0">ML Model</h3>
+      <hr style="border-color:#3a2a50; margin:8px 0">
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🌲 <strong>LightGBM</strong><br>Gradient boosting<br>Fast, interpretable</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🎯 <strong>Target</strong><br>20-day forward return<br>(cross-sectional rank)</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🔁 <strong>Walk-forward</strong><br>2yr rolling train window<br>Retrain monthly</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📊 <strong>Output</strong><br>Predicted return score<br>for each of 500 stocks</p>
+    </td>
+    <td style="background:#1f1e18; border:1px solid #40391a; border-radius:8px; padding:14px; vertical-align:top; width:18%">
+      <div class="label" style="color:#d4b04a">LAYER 4</div>
+      <h3 style="margin:6px 0; color:#e8eaf0">Portfolio Construction</h3>
+      <hr style="border-color:#40391a; margin:8px 0">
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🏆 <strong>Rank & select</strong><br>Top 25 by predicted score<br>Long-only positions</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">⚖️ <strong>Volatility parity</strong><br>Size each position by<br>inverse 20-day vol</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🏭 <strong>Sector cap</strong><br>Max 30% in any<br>one sector</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📅 <strong>Weekly rebalance</strong><br>Replace stocks that<br>drop out of top 25</p>
+    </td>
+    <td style="background:#1f1818; border:1px solid #50201a; border-radius:8px; padding:14px; vertical-align:top; width:18%">
+      <div class="label" style="color:#ff6b6b">LAYER 5</div>
+      <h3 style="margin:6px 0; color:#e8eaf0">Risk Engine</h3>
+      <hr style="border-color:#50201a; margin:8px 0">
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🛡️ <strong>Position limits</strong><br>Max 8% per stock<br>Hard ceiling</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🔪 <strong>Kill switch</strong><br>Daily loss &gt; 2%<br>→ exit all positions</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📉 <strong>Drawdown cap</strong><br>Portfolio DD &gt; 15%<br>→ scale to 50% cash</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">🌡️ <strong>Regime filter</strong><br>VIX &gt; 30 → halve<br>all position sizes</p>
+      <p style="color:#8899bb; font-size:0.82rem; margin:4px 0">📝 <strong>Audit log</strong><br>Every decision written<br>to decisions.jsonl</p>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="5" style="text-align:center; padding:8px 0">
+      <span style="color:#3a4560; font-size:0.8rem">▼ all layers feed into</span>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="5" style="background:#181820; border:1px solid #303050; border-radius:8px; padding:14px; text-align:center">
+      <div class="label" style="color:#60aaff; text-align:center">EXECUTION</div>
+      <p style="color:#8899bb; font-size:0.85rem; margin:4px 0">Alpaca Paper Trading API → orders placed, tracked, and logged. Daily P&amp;L report. SPY benchmark comparison. Signal attribution (which factor contributed how much to today's picks).</p>
+    </td>
+  </tr>
+</table>
+</div>
+
+<p class="subtitle" style="margin-top:1rem; font-size:0.85rem">Each layer is a separate Python module. They talk through DataFrames — clean, testable, replaceable. The risk engine is the last gate before any order reaches Alpaca.</p>

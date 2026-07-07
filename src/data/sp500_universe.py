@@ -8,6 +8,7 @@ The CSV cache means we only hit Wikipedia once (or when you explicitly refresh),
 which is polite to Wikipedia and fast for repeated runs.
 """
 
+import requests
 import pandas as pd
 from config import UNIVERSE_FILE
 
@@ -20,7 +21,12 @@ def fetch_sp500_tickers() -> pd.DataFrame:
     Alpaca's API uses hyphens as the separator for share classes.
     """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url, flavor="lxml")
+    # Wikipedia returns 403 for requests without a User-Agent header.
+    # Sending a descriptive UA is also polite — it lets Wikipedia know who's asking.
+    headers = {"User-Agent": "trading-research/1.0 (educational project; python-requests)"}
+    response = requests.get(url, headers=headers, timeout=15)
+    response.raise_for_status()
+    tables = pd.read_html(response.text, flavor="lxml")
     # The first table on that page is always the constituent list
     df = tables[0][["Symbol", "Security", "GICS Sector", "GICS Sub-Industry"]].copy()
     df.columns = ["ticker", "company", "sector", "sub_industry"]
@@ -46,12 +52,18 @@ def load_sp500_tickers(refresh: bool = False) -> pd.DataFrame:
     return pd.read_csv(UNIVERSE_FILE)
 
 
+# Tickers that Alpaca's API rejects even after the dot→hyphen conversion.
+# BRK/B and BF/B have slash-based share-class separators that neither format resolves.
+_ALPACA_UNSUPPORTED: set[str] = {"BRK-B", "BF-B"}
+
+
 def get_symbols(refresh: bool = False) -> list[str]:
     """Return list of S&P 500 ticker symbols (Alpaca-compatible).
 
     This is the main entry point for other modules that just need the ticker list.
     """
-    return load_sp500_tickers(refresh)["ticker"].tolist()
+    all_tickers = load_sp500_tickers(refresh)["ticker"].tolist()
+    return [t for t in all_tickers if t not in _ALPACA_UNSUPPORTED]
 
 
 def get_sector_map(refresh: bool = False) -> dict[str, str]:

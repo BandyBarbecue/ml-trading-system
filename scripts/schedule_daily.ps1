@@ -2,7 +2,11 @@
 # Usage: .\scripts\schedule_daily.ps1 [-DryRun]
 #
 # Designed to be called by Windows Task Scheduler at 8:30 AM ET on trading days.
-# Activates the project venv, runs the daily pipeline, and logs all output.
+#
+# Note: daily_run.py writes its own detailed logs directly to data/logs/ via its
+# own FileHandler. This script adds start/end markers around that output.
+# We do NOT use "2>&1 | Tee-Object" because that pipeline causes PowerShell 5.1
+# to corrupt $LASTEXITCODE and would double-write to the log file.
 
 param(
     [switch]$DryRun
@@ -12,7 +16,7 @@ param(
 # sets the working directory.
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
-$VenvActivate = Join-Path $ProjectRoot ".venv\Scripts\Activate.ps1"
+$Python      = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $LogDir      = Join-Path $ProjectRoot "data\logs"
 
 # Create log directory if it doesn't exist
@@ -26,38 +30,32 @@ function Write-Log {
     "$stamp  $Message" | Tee-Object -FilePath $LogFile -Append
 }
 
-# Check dry-run first to avoid log file creation issues
 if ($DryRun) {
     Write-Host "=== Daily run (DRY RUN) ==="
     Write-Host "Project root: $ProjectRoot"
-    Write-Host "Dry run: True"
     Write-Host "Dry run mode - skipping actual pipeline execution."
     Write-Host "=== Dry run complete ==="
     exit 0
 }
 
-Write-Log "=== Daily run starting ==="
-Write-Log "Project root: $ProjectRoot"
-Write-Log "Dry run: $DryRun"
-
-# Activate virtual environment
-if (-not (Test-Path $VenvActivate)) {
-    Write-Log "ERROR: venv not found at $VenvActivate - run: python -m venv .venv"
+if (-not (Test-Path $Python)) {
+    Write-Log "ERROR: Python not found at $Python - run: python -m venv .venv"
     exit 1
 }
 
-& $VenvActivate
+Write-Log "=== Daily run starting ==="
+Write-Log "Project root: $ProjectRoot"
+Write-Log "Python: $Python"
 
-# Change to project root so relative imports work
+# Run from project root so relative imports (src.*) resolve correctly.
 Set-Location $ProjectRoot
 
-# Build the python command
+# PYTHONUNBUFFERED=1 ensures Python flushes log output immediately.
+$env:PYTHONUNBUFFERED = "1"
+
 $PythonArgs = @("-m", "src.execution.daily_run")
 
-Write-Log "Running: python $($PythonArgs -join ' ')"
-
-# Run the pipeline, capturing exit code
-& python @PythonArgs 2>&1 | Tee-Object -FilePath $LogFile -Append
+& $Python @PythonArgs
 $ExitCode = $LASTEXITCODE
 
 Write-Log "=== Daily run finished: exit code $ExitCode ==="

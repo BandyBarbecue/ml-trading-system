@@ -16,6 +16,7 @@ Data is stored as Parquet (a compressed columnar format) rather than CSV because
 
 import yfinance as yf
 import pandas as pd
+from datetime import datetime
 from config import VIX_FILE, DATA_DIR
 
 
@@ -58,6 +59,9 @@ def update_vix() -> None:
         last = existing.index.max()
         # Start from the day after our last stored date
         start = (last + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        # If we're already up to date, nothing to do (avoids yfinance "start > end" error)
+        if start > datetime.now().strftime("%Y-%m-%d"):
+            return
         new_data = fetch_vix(start=start)
         combined = pd.concat([existing, new_data])
     else:

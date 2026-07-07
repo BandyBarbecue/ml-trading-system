@@ -63,13 +63,24 @@ def update_earnings(symbols: list[str] | None = None) -> None:
         existing = pd.DataFrame()
         fetched_tickers = set()
 
+    if not config.FMP_API_KEY:
+        print("[info] FMP_API_KEY not set — skipping earnings update.")
+        return
+
     rows = []
     for ticker in symbols:
         if ticker in fetched_tickers:
             # Already have full history for this ticker — skip to save API quota
             continue
 
-        data = _fetch_symbol_earnings(ticker)
+        try:
+            data = _fetch_symbol_earnings(ticker)
+        except Exception as exc:
+            # 403 = no paid FMP subscription; other errors = network/rate-limit.
+            # Log without the URL (it contains the API key) and abort immediately.
+            err_type = type(exc).__name__
+            print(f"[warn] Earnings fetch failed for {ticker}: {err_type} — aborting earnings update.")
+            return
         for item in data:
             actual = item.get("eps")
             estimated = item.get("epsEstimated")

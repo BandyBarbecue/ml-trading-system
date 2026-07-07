@@ -524,7 +524,10 @@ if __name__ == "__main__":
 
     print(f"\nDaily run complete — Step {result['step']}/7 | Orders: {len(result['orders'])}")
     if result["errors"]:
-        print("Errors encountered:")
+        print("Warnings / soft errors (pipeline continued):")
         for err in result["errors"]:
             print(f"  • {err}")
-    sys.exit(0 if not result["errors"] else 1)
+    # Exit 0 if the pipeline completed all 7 steps — soft data-source warnings
+    # (e.g. one earnings ticker failing, FRED DNS timeout) don't count as failure.
+    # Exit 1 only if the pipeline aborted before step 7 (feature matrix crash, etc.).
+    sys.exit(0 if result["step"] == 7 else 1)

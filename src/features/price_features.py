@@ -132,7 +132,13 @@ def load_all_prices(symbols: list[str]) -> dict[str, pd.DataFrame]:
     for ticker in symbols:
         path = PRICES_DIR / f"{ticker}.parquet"
         if path.exists():
-            prices[ticker] = pd.read_parquet(path)[["close"]]
+            df = pd.read_parquet(path)[["close"]]
+            # Alpaca returns tz-aware UTC timestamps (e.g. "2024-01-03 04:00:00+00:00").
+            # Normalise to midnight and strip tz so that string-date lookups like
+            # df.loc["2024-01-03", col] return a scalar rather than a length-1 Series.
+            if hasattr(df.index, "tz") and df.index.tz is not None:
+                df.index = df.index.normalize().tz_localize(None)
+            prices[ticker] = df
     return prices
 
 

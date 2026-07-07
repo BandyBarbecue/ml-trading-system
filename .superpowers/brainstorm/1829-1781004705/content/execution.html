@@ -1,0 +1,147 @@
+<h2>Section 6: Daily Execution Loop + Directory Layout</h2>
+<p class="subtitle">One script orchestrates everything. Runs each morning before market open. Every decision is logged.</p>
+
+<div class="section">
+  <h3>The daily pipeline — 8:30 AM ET</h3>
+  <div style="font-size:0.83rem; margin-top:0.8rem">
+
+    <div style="display:flex; gap:0; flex-direction:column">
+
+      <div style="display:flex; align-items:stretch; gap:0">
+        <div style="width:28px; display:flex; flex-direction:column; align-items:center; margin-right:10px">
+          <div style="width:2px; background:#6b8cff; flex:1; min-height:4px"></div>
+          <div style="width:10px; height:10px; border-radius:50%; background:#6b8cff; flex-shrink:0"></div>
+          <div style="width:2px; background:#6b8cff; flex:1"></div>
+        </div>
+        <div style="background:#1a1f2e; border:1px solid #2a3550; border-radius:6px; padding:10px; margin-bottom:6px; flex:1">
+          <strong style="color:#6b8cff">1. Fetch data</strong>
+          <span style="color:#5a6a8a"> — ~2 min</span>
+          <p style="color:#7a8aaa; margin:3px 0 0">Top-up yesterday's price bars (500 stocks via Alpaca). Fetch overnight news headlines. Update VIX. Check for new earnings reports (FMP).</p>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:stretch; gap:0">
+        <div style="width:28px; display:flex; flex-direction:column; align-items:center; margin-right:10px">
+          <div style="width:2px; background:#b06bff; flex:1"></div>
+          <div style="width:10px; height:10px; border-radius:50%; background:#b06bff; flex-shrink:0"></div>
+          <div style="width:2px; background:#b06bff; flex:1"></div>
+        </div>
+        <div style="background:#1f1a2e; border:1px solid #3a2a50; border-radius:6px; padding:10px; margin-bottom:6px; flex:1">
+          <strong style="color:#b06bff">2. Claude NLP extraction</strong>
+          <span style="color:#5a6a8a"> — ~3 min, ~$0.30</span>
+          <p style="color:#7a8aaa; margin:3px 0 0">Send new headlines to Claude Haiku in batches of 20. Cache results — already-processed headlines are skipped. Output: news_scores + supply_chain_scores per ticker.</p>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:stretch; gap:0">
+        <div style="width:28px; display:flex; flex-direction:column; align-items:center; margin-right:10px">
+          <div style="width:2px; background:#4caf6f; flex:1"></div>
+          <div style="width:10px; height:10px; border-radius:50%; background:#4caf6f; flex-shrink:0"></div>
+          <div style="width:2px; background:#4caf6f; flex:1"></div>
+        </div>
+        <div style="background:#1a201a; border:1px solid #2a4030; border-radius:6px; padding:10px; margin-bottom:6px; flex:1">
+          <strong style="color:#4caf6f">3. Compute features + IC update</strong>
+          <span style="color:#5a6a8a"> — ~30 sec</span>
+          <p style="color:#7a8aaa; margin:3px 0 0">Price momentum, mean reversion, vol for all 500. Merge news scores and earnings surprise. Recompute 60-day rolling IC for each feature. Cross-sectional z-score everything.</p>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:stretch; gap:0">
+        <div style="width:28px; display:flex; flex-direction:column; align-items:center; margin-right:10px">
+          <div style="width:2px; background:#d4b04a; flex:1"></div>
+          <div style="width:10px; height:10px; border-radius:50%; background:#d4b04a; flex-shrink:0"></div>
+          <div style="width:2px; background:#d4b04a; flex:1"></div>
+        </div>
+        <div style="background:#1f1e18; border:1px solid #40391a; border-radius:6px; padding:10px; margin-bottom:6px; flex:1">
+          <strong style="color:#d4b04a">4. ML inference (+ monthly retrain)</strong>
+          <span style="color:#5a6a8a"> — 30 sec daily / 5 min monthly</span>
+          <p style="color:#7a8aaa; margin:3px 0 0">Daily: run LightGBM on today's features → predicted_score for 500 stocks. First trading day of month: retrain on rolling 2-year window with updated IC weights.</p>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:stretch; gap:0">
+        <div style="width:28px; display:flex; flex-direction:column; align-items:center; margin-right:10px">
+          <div style="width:2px; background:#ff8c4a; flex:1"></div>
+          <div style="width:10px; height:10px; border-radius:50%; background:#ff8c4a; flex-shrink:0"></div>
+          <div style="width:2px; background:#ff8c4a; flex:1"></div>
+        </div>
+        <div style="background:#1f1a18; border:1px solid #402818; border-radius:6px; padding:10px; margin-bottom:6px; flex:1">
+          <strong style="color:#ff8c4a">5. Portfolio construction (Mondays only)</strong>
+          <span style="color:#5a6a8a"> — ~10 sec</span>
+          <p style="color:#7a8aaa; margin:3px 0 0">Select top 25. Run HRP on their 60-day covariance. Apply sector cap. Diff against current holdings. Generate trade list with turnover cap enforced.</p>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:stretch; gap:0">
+        <div style="width:28px; display:flex; flex-direction:column; align-items:center; margin-right:10px">
+          <div style="width:2px; background:#ff6b6b; flex:1"></div>
+          <div style="width:10px; height:10px; border-radius:50%; background:#ff6b6b; flex-shrink:0"></div>
+          <div style="width:2px; background:#ff6b6b; flex:1"></div>
+        </div>
+        <div style="background:#1f1818; border:1px solid #501a1a; border-radius:6px; padding:10px; margin-bottom:6px; flex:1">
+          <strong style="color:#ff6b6b">6. Risk engine veto + execute</strong>
+          <span style="color:#5a6a8a"> — ~5 sec</span>
+          <p style="color:#7a8aaa; margin:3px 0 0">VIX check, drawdown check, position limits. If all clear: submit orders to Alpaca paper trading API. Log every decision (approved or vetoed) to decisions.jsonl.</p>
+        </div>
+      </div>
+
+      <div style="display:flex; align-items:stretch; gap:0">
+        <div style="width:28px; display:flex; flex-direction:column; align-items:center; margin-right:10px">
+          <div style="width:2px; background:#60aaff; flex:1"></div>
+          <div style="width:10px; height:10px; border-radius:50%; background:#60aaff; flex-shrink:0"></div>
+          <div style="width:2px; background:#60aaff; flex:1; min-height:4px"></div>
+        </div>
+        <div style="background:#181828; border:1px solid #282840; border-radius:6px; padding:10px; flex:1">
+          <strong style="color:#60aaff">7. Daily report</strong>
+          <span style="color:#5a6a8a"> — printed to terminal + saved</span>
+          <p style="color:#7a8aaa; margin:3px 0 0">P&L vs SPY benchmark. Current 25 positions + weights. Top signals: which stocks moved up/down the ranking and why. Factor attribution: what % of today's picks were driven by momentum vs news vs earnings.</p>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:1.5rem">
+  <h3>New directory layout</h3>
+  <pre style="color:#7a9aaa; font-size:0.79rem; margin:0; line-height:1.7; background:#0f1318; border:1px solid #1a2030; border-radius:6px; padding:14px">trading-research/
+├── config.py                        ← add SP500, FMP_API_KEY, Claude model settings
+├── requirements.txt                 ← add lightgbm, scipy, scikit-learn, yfinance, pyarrow
+├── .env                             ← add FMP_API_KEY (Anthropic key already there)
+├── data/
+│   ├── prices/                      ← AAPL.parquet, MSFT.parquet … (500 files)
+│   ├── news/                        ← 2026-06-09.parquet … (one per day)
+│   ├── earnings/earnings.parquet    ← all tickers, all quarters
+│   ├── features/                    ← cached daily feature matrices
+│   ├── models/                      ← serialised LightGBM .pkl files (one per retrain)
+│   ├── sp500_tickers.csv
+│   └── vix.parquet
+├── src/
+│   ├── data/
+│   │   ├── fetch_prices.py          ← replaces fetch_data.py
+│   │   ├── fetch_news.py
+│   │   ├── fetch_earnings.py
+│   │   ├── fetch_vix.py
+│   │   └── sp500_universe.py
+│   ├── features/
+│   │   ├── price_features.py        ← momentum, reversal, vol
+│   │   ├── nlp_features.py          ← Claude extraction pipeline
+│   │   └── earnings_features.py     ← SUE computation
+│   ├── ml/
+│   │   ├── model.py                 ← LightGBM train + inference
+│   │   └── ic_tracker.py           ← rolling IC computation + weights
+│   ├── portfolio/
+│   │   ├── hrp.py                   ← Hierarchical Risk Parity
+│   │   └── construction.py          ← select top 25, apply sector cap
+│   ├── risk/
+│   │   └── engine.py                ← extend existing
+│   ├── backtest/
+│   │   ├── run_backtest.py          ← extend existing for new signals
+│   │   └── walk_forward.py          ← extend existing
+│   └── execution/
+│       ├── daily_run.py             ← the main orchestrator (steps 1–7 above)
+│       └── paper_trader.py          ← Alpaca order submission
+└── notebooks/                       ← exploration, one-off analysis</pre>
+</div>
+
+<p class="subtitle" style="font-size:0.85rem; margin-top:1.2rem">Does this execution loop and directory layout look right? This is the last design section — if you approve, I'll write the full spec doc and we can move to implementation planning.</p>

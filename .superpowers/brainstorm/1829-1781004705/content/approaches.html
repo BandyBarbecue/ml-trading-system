@@ -1,0 +1,42 @@
+<h2>Three architectures for your system</h2>
+<p class="subtitle">All use S&P 500 + news sentiment + earnings surprise. The difference is how signals combine and when trades fire.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Multi-Factor ML Fusion ⭐ Recommended</h3>
+      <p>Every stock gets a daily score from 4–6 features: price momentum (1m/3m/12m), short-term mean reversion, news sentiment (NLP on Alpaca headlines), and earnings surprise (FMP). A LightGBM model — trained on historical data — learns which combination of these predicts 20-day forward returns best. Rank all 500 stocks by predicted return, go long the top 20–30. Retrain monthly on a rolling 2-year window. Regime filter scales position sizes down in high-volatility markets.</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul><li>Academically grounded — each factor has decades of evidence</li><li>ML learns signal weights from data, not guesswork</li><li>Diversified across 20–30 positions</li><li>Walk-forward prevents overfitting</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>Needs ~2 years of training data per retrain cycle</li><li>Feature engineering takes time to get right</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>News-First Event-Driven</h3>
+      <p>The NLP pipeline is the gatekeeper. A significant news event (earnings beat, CEO change, FDA approval) must be detected first. If sentiment score crosses a threshold, a position opens. Price momentum and volatility are used as confirmation filters — don't buy into a news spike if the stock is already parabolic. Fewer trades but each is high-conviction. More like a systematic version of how discretionary traders operate.</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul><li>Intuitive — humans already trade news this way</li><li>High signal-to-noise per trade</li><li>Interpretable: "I bought because X happened"</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>Sparser trades → less data to validate on</li><li>Event detection threshold is hard to calibrate</li><li>Misses slow-moving fundamental trends</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Regime-Switching Multi-Strategy</h3>
+      <p>A regime detector (Hidden Markov Model or VIX-based) classifies the market each day: bull/trending, range-bound, or crisis. A different sub-strategy activates per regime: momentum in bull markets, mean-reversion + news in sideways markets, defensive (SPY short or cash) in crises. Each regime has its own position-sizing rules. Most adaptive, but most complex to build and validate.</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul><li>Adapts to market conditions — doesn't run momentum into a crash</li><li>Can survive 2008, 2020, 2022</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>Three sub-systems to build and validate</li><li>Regime detection itself can overfit</li><li>Much more complex to backtest correctly</li></ul></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:1.5rem; font-size:0.85rem">⭐ Recommendation: A. It's the architecture used by systematic hedge funds like AQR and Two Sigma at their core. ML learns the right signal weights. The 2-month timeline is achievable. B and C are good extensions to add on top of A later.</p>
