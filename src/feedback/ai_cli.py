@@ -85,17 +85,25 @@ def run_symbol(symbol: str) -> None:
         print(f"  Risk: {'APPROVED' if risk_approved else 'VETOED'} — {risk_reason}")
         print("  Asking Claude...", end="", flush=True)
 
-        decision, reasoning = review_signal(
-            symbol=symbol,
-            signal_type=signal_type,
-            signal_date=str(date.date()),
-            price=price,
-            short_ma=s_ma,
-            long_ma=l_ma,
-            portfolio_value=portfolio_value,
-            risk_approved=risk_approved,
-            risk_reason=risk_reason,
-        )
+        # review_signal handles API errors internally (returning a conservative
+        # reject), but this belt-and-suspenders guard means even an unexpected
+        # bug in the reviewer only skips ONE signal instead of killing the
+        # whole run — log it and move on to the next signal.
+        try:
+            decision, reasoning = review_signal(
+                symbol=symbol,
+                signal_type=signal_type,
+                signal_date=str(date.date()),
+                price=price,
+                short_ma=s_ma,
+                long_ma=l_ma,
+                portfolio_value=portfolio_value,
+                risk_approved=risk_approved,
+                risk_reason=risk_reason,
+            )
+        except Exception as exc:  # noqa: BLE001 — deliberately broad: keep the loop alive
+            print(f" FAILED ({type(exc).__name__}: {exc}) — skipping this signal.")
+            continue
 
         print(f" {decision.upper()}")
         print(f"  Reasoning: {reasoning}")

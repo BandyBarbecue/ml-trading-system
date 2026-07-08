@@ -14,20 +14,102 @@ price sticker, and submits the transaction — but never buys fractions of a
 share, and never spends more than the budget allows.
 """
 
+import json
 import logging
 import math
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
 import config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Run lock — prevents two overlapping runs (daily_run.py / intraday_runner.py)
+# from double-submitting orders (e.g. Task Scheduler firing a run that hasn't
+# finished yet, or a manual run colliding with the scheduled one).
+# ---------------------------------------------------------------------------
+
+_LOCK_STALE_SECONDS = 2 * 60 * 60  # 2 hours — long enough for a slow run, short
+                                    # enough that a crashed process's stale lock
+                                    # doesn't block trading indefinitely
+
+
+def _lock_path() -> Path:
+    return config.DATA_DIR / "run.lock"
+
+
+def acquire_run_lock() -> bool:
+    """Create data/run.lock so a second overlapping run refuses to start.
+
+    Call this at the very top of run_daily()/run_intraday(), and always
+    release it in a finally block via release_run_lock().
+
+    Returns
+    -------
+    True  — lock acquired, caller may proceed.
+    False — another run already holds a live (non-stale) lock; caller must
+            exit immediately without submitting any orders.
+    """
+    path = _lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text())
+            lock_time = datetime.fromisoformat(payload["timestamp"])
+            age_seconds = (datetime.now(timezone.utc) - lock_time).total_seconds()
+        except Exception:
+            # Unreadable/corrupt lock file — treat as stale so we don't get
+            # permanently stuck; reclaiming is safer than blocking forever.
+            age_seconds = _LOCK_STALE_SECONDS + 1
+
+        if age_seconds <= _LOCK_STALE_SECONDS:
+            logger.error(
+                "run.lock is held (age %.0fs) — another run appears to be in "
+                "progress. Refusing to start to avoid double-submitting orders.",
+                age_seconds,
+            )
+            return False
+        logger.warning(
+            "run.lock is stale (age %.0fs > %ds) — assuming the previous run "
+            "crashed and reclaiming the lock.", age_seconds, _LOCK_STALE_SECONDS,
+        )
+
+    payload = {"pid": os.getpid(), "timestamp": datetime.now(timezone.utc).isoformat()}
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(payload))
+        os.replace(tmp_name, path)  # atomic — no reader ever sees a half-written lock
+    except Exception:
+        try:
+            os.remove(tmp_name)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def release_run_lock() -> None:
+    """Remove data/run.lock. Always call from a finally block so a mid-run
+    exception doesn't leave the lock held forever."""
+    path = _lock_path()
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove run.lock: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +230,53 @@ def submit_rebalance(
     results: list[dict] = []
     data_client = _make_data_client()
 
+    # --- Fetch current holdings once, up front ------------------------------
+    # Used below to clamp SELL orders so a stale weight delta (e.g. computed
+    # from slightly out-of-date positions) can never sell more than we
+    # actually hold and accidentally open a short position — this system is
+    # long-only unless LONG_SHORT_ENABLED, and even then shorts must be
+    # deliberate, not an artifact of stale data.
+    held_qty: dict[str, float] = {}
+    positions_fetched = False
+    try:
+        positions = client.get_all_positions()
+        held_qty = {pos.symbol: float(pos.qty) for pos in positions}
+        positions_fetched = True
+    except Exception as exc:
+        # If we can't confirm what we hold, we can't safely clamp — proceed
+        # without clamping rather than wrongly zeroing every SELL to 0.
+        logger.warning(
+            "Could not fetch current positions for oversell clamp (%s) — "
+            "proceeding without clamping SELL orders this run.", exc,
+        )
+
     for ticker, delta in trade_deltas.items():
         # Skip zero deltas — nothing to do.
         if delta == 0:
             continue
+
+        # --- Skip if an order for this symbol is already open -------------------
+        # Avoids double-submitting when a prior run's order hasn't filled yet
+        # (e.g. this run overlaps the tail end of a slow previous run, or a
+        # limit-like partial fill is still open). Wrapped in try/except: an
+        # API hiccup here must not kill the whole rebalance — worst case we
+        # submit a duplicate order, which is recoverable, vs. halting all
+        # trading on a transient network blip.
+        try:
+            open_orders = client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[ticker])
+            )
+            if len(open_orders) > 0:
+                logger.warning(
+                    "Skipping %s: an open order already exists — avoids a duplicate submission.",
+                    ticker,
+                )
+                continue
+        except Exception as exc:
+            logger.warning(
+                "Could not check open orders for %s (%s) — proceeding with submission.",
+                ticker, exc,
+            )
 
         # --- Fetch current quote -----------------------------------------------
         # Quotes come from StockHistoricalDataClient, not TradingClient.
@@ -182,6 +307,17 @@ def submit_rebalance(
         # Shares        = dollar amount / price per share  (floored to integer)
         dollar_amount = abs(delta) * account_value
         shares = math.floor(dollar_amount / price)
+
+        # --- Clamp SELL quantity to actual held shares ---------------------------
+        if side == OrderSide.SELL and positions_fetched:
+            held = held_qty.get(ticker, 0.0)
+            if shares > held:
+                logger.warning(
+                    "Clamping SELL %s from %d to %d shares (stale delta exceeded "
+                    "held quantity — prevents opening an accidental short).",
+                    ticker, shares, int(held),
+                )
+                shares = int(held)
 
         if shares < 1:
             # Too small to trade; quietly skip rather than sending a 0-share order.

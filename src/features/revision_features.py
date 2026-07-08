@@ -20,7 +20,13 @@ from pathlib import Path
 
 import config
 
-REVISION_WINDOW = 90  # days of earnings history to include
+# Quarterly earnings reports land ~91-92 calendar days apart (a year / 4).
+# A 90-day window is *shorter* than that real-world gap, so the previous
+# report usually falls just outside it and revision_momentum ends up NaN
+# for nearly every real ticker (it needs >= 2 reports in-window). 120 days
+# comfortably covers one quarterly gap with room to spare for reporting
+# schedule jitter.
+REVISION_WINDOW = 120  # days of earnings history to include
 
 
 def compute_revision_features(

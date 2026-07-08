@@ -20,6 +20,7 @@ Paper trading only — no live capital, ever.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timedelta
@@ -37,6 +38,13 @@ _ET = ZoneInfo("America/New_York")
 # Market open time components (hour, minute).
 _MARKET_OPEN_HOUR   = 9
 _MARKET_OPEN_MINUTE = 30
+
+# daily_run.py's Step 5 (portfolio construction) only reruns on Mondays, so a
+# target_weights.json file up to about a week old is still this week's live
+# rebalance. Anything older than this means a rebalance was probably missed
+# (e.g. daily_run.py has been failing) — trusting HRP sizing that stale is
+# riskier than just falling back to equal-weight, so we don't.
+_TARGET_WEIGHTS_MAX_AGE_DAYS = 7
 
 
 def _now_et() -> datetime:
@@ -103,6 +111,70 @@ def _next_bar_time(now: datetime) -> datetime:
     return now.replace(minute=next_minutes, second=0, microsecond=0)
 
 
+def _is_final_bar(now: datetime) -> bool:
+    """True if the NEXT 30-minute boundary is at or past INTRADAY_CLOSE_TIME —
+    i.e. this is the last bar that will be processed today.
+
+    Bars are 30-min aligned but INTRADAY_CLOSE_TIME (15:50) usually isn't, so
+    we can't just compare `now` to the close time directly: the loop's outer
+    `_is_market_hours` check already guarantees `now < close_time`, meaning
+    "now == close time" never happens. Instead we look ahead to the next
+    scheduled bar boundary — if that boundary would be at/after close, this
+    bar is the final one, and this is where the "eod" signal should actually
+    liquidate (see run_bar).
+    """
+    close_h, close_m = map(int, config.INTRADAY_CLOSE_TIME.split(":"))
+    next_bar = _next_bar_time(now)
+    return (next_bar.hour, next_bar.minute) >= (close_h, close_m)
+
+
+# ---------------------------------------------------------------------------
+# HRP target weights (persisted by daily_run.py Step 5)
+# ---------------------------------------------------------------------------
+
+def _load_target_weights(now: datetime | None = None) -> dict[str, float]:
+    """Load Step 5's HRP-sized target weights from data/target_weights.json.
+
+    Without this, run_bar previously sized every "full" entry as a naive
+    1/N equal weight, throwing away all the HRP risk-parity sizing daily_run
+    computed on Monday. Falls back to an empty dict — meaning callers use
+    per-ticker equal-weight instead — if the file is missing, corrupt, or
+    older than _TARGET_WEIGHTS_MAX_AGE_DAYS.
+
+    Returns
+    -------
+    dict[ticker, weight] — empty dict on any failure (logged as a warning).
+    """
+    path = config.DATA_DIR / "target_weights.json"
+    if not path.exists():
+        logger.warning(
+            "target_weights.json not found — falling back to equal-weight sizing."
+        )
+        return {}
+
+    try:
+        payload = json.loads(path.read_text())
+        file_date = datetime.strptime(payload["date"], "%Y-%m-%d").date()
+        weights = {k: float(v) for k, v in payload.get("weights", {}).items()}
+    except Exception as exc:
+        logger.warning(
+            "target_weights.json unreadable (%s) — falling back to equal-weight sizing.",
+            exc,
+        )
+        return {}
+
+    today_date = (now or _now_et()).date()
+    age_days = (today_date - file_date).days
+    if age_days > _TARGET_WEIGHTS_MAX_AGE_DAYS:
+        logger.warning(
+            "target_weights.json is %d day(s) old (> %d) — falling back to "
+            "equal-weight sizing.", age_days, _TARGET_WEIGHTS_MAX_AGE_DAYS,
+        )
+        return {}
+
+    return weights
+
+
 # ---------------------------------------------------------------------------
 # Single-bar processor
 # ---------------------------------------------------------------------------
@@ -112,18 +184,24 @@ def run_bar(
     held_tickers: list[str],
     news_signals: list[dict],
     dry_run: bool = False,
+    is_final_bar: bool = False,
 ) -> list[dict]:
     """Process one 30-minute bar across all held tickers.
 
     For each ticker currently held in the portfolio:
       1. Fetch intraday 30-min bars for today.
       2. Get VWAP entry signal (full / half / eod).
-      3. Translate the signal into a target weight:
-           "full" → equal-weight  (1 / N positions)
-           "half" → half weight   (0.5 / N positions)
-           "eod"  → close out     (weight = 0)
-      4. Compute the weight delta vs. current equal-weight holding and
-         queue a rebalance order if the delta is non-zero.
+      3. Translate the signal into a target weight, scaled toward the HRP
+         weight daily_run.py's Step 5 computed for this ticker (falling back
+         to equal-weight 1/N per ticker if target_weights.json is missing or
+         stale — see _load_target_weights):
+           "full" → the full HRP target weight
+           "half" → half of the HRP target weight
+           "eod"  → on the FINAL bar of the day: close out (weight = 0).
+                    On any earlier bar: hold — no trade this bar at all
+                    (see is_final_bar below for why).
+      4. Compute the weight delta vs. current holding and queue a rebalance
+         order if the delta is non-zero.
       5. Independently check for Claude NLP event signals on the ticker;
          if one qualifies (confidence ≥ 0.85, magnitude "large"), add an
          event trade on top.
@@ -134,6 +212,11 @@ def run_bar(
     held_tickers:  List of ticker symbols currently held in the portfolio.
     news_signals:  List of pre-extracted NLP signal dicts (from extract_signals).
     dry_run:       If True, skip all order submission and return [].
+    is_final_bar:  True only for the last 30-min bar of the trading day (see
+                   _is_final_bar). Controls whether "eod" actually liquidates
+                   (final bar) or just means "hold, don't trade yet" (every
+                   other bar) — mapping "eod" to an immediate weight-0 target
+                   on EVERY bar caused a sell/rebuy whipsaw every 30 minutes.
 
     Returns
     -------
@@ -158,8 +241,11 @@ def run_bar(
     today = _now_et().strftime("%Y-%m-%d")
     n     = len(held_tickers)
 
-    # Equal-weight baseline: every held ticker targets 1/N of portfolio value.
+    # Equal-weight fallback — used per-ticker only when target_weights.json
+    # doesn't have an entry for that ticker (missing/stale file, or a ticker
+    # that isn't part of the current HRP portfolio yet).
     equal_weight = 1.0 / n
+    hrp_targets  = _load_target_weights()
 
     # ------------------------------------------------------------------
     # Build target weights from VWAP entry signals
@@ -171,16 +257,26 @@ def run_bar(
     for ticker in held_tickers:
         bars = fetch_intraday(data_client, ticker, today)
         signal = get_entry_signal(bars, bar_idx)
+        hrp_target = hrp_targets.get(ticker, equal_weight)
 
         if signal == "full":
-            target_weights[ticker] = equal_weight
+            target_weights[ticker] = hrp_target
         elif signal == "half":
-            target_weights[ticker] = 0.5 / n
+            target_weights[ticker] = 0.5 * hrp_target
         elif signal == "eod":
-            target_weights[ticker] = 0.0
+            if is_final_bar:
+                # The actual end of the trading day — liquidate.
+                target_weights[ticker] = 0.0
+            else:
+                # Not the final bar: leave the position unchanged. Skipping
+                # this ticker entirely (not adding it to target_weights)
+                # means no delta is computed for it below, so no order is
+                # submitted this bar — the whole point is to avoid selling
+                # now only to rebuy 30 minutes later.
+                continue
         else:
             # "skip" or unknown — treat as full for now
-            target_weights[ticker] = equal_weight
+            target_weights[ticker] = hrp_target
 
     # ------------------------------------------------------------------
     # Determine weight deltas vs. current positions
@@ -245,14 +341,26 @@ def run_intraday(dry_run: bool = False, date: str | None = None) -> None:
       5. Sleep until the next 30-minute boundary.
       6. Stop when time >= config.INTRADAY_CLOSE_TIME ("15:50").
 
+    Before doing anything else, this checks two restart-safety guards:
+      - risk_state.is_halted(today): if the kill switch fired earlier today
+        (in this run or a crashed prior run), refuse to trade again today.
+      - paper_trader.acquire_run_lock(): refuse to start if another run
+        (e.g. an overlapping Task Scheduler fire) already holds the lock.
+
     Parameters
     ----------
     dry_run: If True, all steps run but no orders are submitted to Alpaca.
     date:    Override for "today" (YYYY-MM-DD string).  Default: actual today.
              Useful when replaying a historical session in tests.
     """
-    from src.execution.paper_trader import _make_trading_client, get_current_positions
-    from src.features.nlp_features  import extract_signals
+    from src.execution.paper_trader import (
+        _make_trading_client,
+        get_current_positions,
+        acquire_run_lock,
+        release_run_lock,
+    )
+    from src.execution.risk_state  import is_halted
+    from src.features.nlp_features import extract_signals
 
     logger.info(
         "=== Intraday runner starting (dry_run=%s, date=%s) ===",
@@ -264,69 +372,94 @@ def run_intraday(dry_run: bool = False, date: str | None = None) -> None:
     # from datetime.now() so market-hour checks are accurate.
     today_str = date or _now_et().strftime("%Y-%m-%d")
 
-    bar_idx = 0
+    # --- Restart-safe halt check -----------------------------------------
+    if is_halted(today_str):
+        logger.error(
+            "Trading halted for %s (kill switch fired earlier today) — "
+            "refusing to run the intraday loop.", today_str,
+        )
+        return
 
-    while _is_market_hours(_now_et()):
-        now = _now_et()
-        logger.info("--- Bar %d at %s ---", bar_idx, now.strftime("%H:%M:%S ET"))
+    # --- Run lock ----------------------------------------------------------
+    if not acquire_run_lock():
+        logger.error(
+            "Another run is already in progress (run.lock held) — exiting "
+            "without running the intraday loop."
+        )
+        return
 
-        # Step 1: current holdings
-        held_tickers: list[str] = []
-        try:
-            trading_client  = _make_trading_client()
-            current_weights = get_current_positions(trading_client)
-            held_tickers    = list(current_weights.index)
-        except Exception as exc:
-            logger.warning("Could not fetch positions: %s — using empty list.", exc)
+    try:
+        bar_idx = 0
 
-        # Step 2: load today's raw headlines parquet
-        news_df = pd.DataFrame()
-        try:
-            news_path = config.NEWS_DIR / f"{today_str}.parquet"
-            news_df   = pd.read_parquet(news_path)
-        except Exception as exc:
-            logger.debug(
-                "Could not load news parquet for %s: %s — proceeding with no news.",
-                today_str, exc,
+        while _is_market_hours(_now_et()):
+            now = _now_et()
+            final_bar = _is_final_bar(now)
+            logger.info(
+                "--- Bar %d at %s%s ---",
+                bar_idx, now.strftime("%H:%M:%S ET"),
+                " (final bar)" if final_bar else "",
             )
 
-        # Step 3: extract NLP signals from raw headlines
-        # extract_signals expects a DataFrame with a "headline" column.
-        # If news_df is empty or missing the column, we pass an empty list.
-        news_signals: list[dict] = []
-        if not news_df.empty and "headline" in news_df.columns:
+            # Step 1: current holdings
+            held_tickers: list[str] = []
             try:
-                news_signals = extract_signals(news_df)
+                trading_client  = _make_trading_client()
+                current_weights = get_current_positions(trading_client)
+                held_tickers    = list(current_weights.index)
             except Exception as exc:
-                logger.warning("extract_signals failed: %s — no NLP signals.", exc)
+                logger.warning("Could not fetch positions: %s — using empty list.", exc)
 
-        # Step 4: process this bar
-        try:
-            run_bar(
-                bar_idx      = bar_idx,
-                held_tickers = held_tickers,
-                news_signals = news_signals,
-                dry_run      = dry_run,
+            # Step 2: load today's raw headlines parquet
+            news_df = pd.DataFrame()
+            try:
+                news_path = config.NEWS_DIR / f"{today_str}.parquet"
+                news_df   = pd.read_parquet(news_path)
+            except Exception as exc:
+                logger.debug(
+                    "Could not load news parquet for %s: %s — proceeding with no news.",
+                    today_str, exc,
+                )
+
+            # Step 3: extract NLP signals from raw headlines
+            # extract_signals expects a DataFrame with a "headline" column.
+            # If news_df is empty or missing the column, we pass an empty list.
+            news_signals: list[dict] = []
+            if not news_df.empty and "headline" in news_df.columns:
+                try:
+                    news_signals = extract_signals(news_df)
+                except Exception as exc:
+                    logger.warning("extract_signals failed: %s — no NLP signals.", exc)
+
+            # Step 4: process this bar
+            try:
+                run_bar(
+                    bar_idx      = bar_idx,
+                    held_tickers = held_tickers,
+                    news_signals = news_signals,
+                    dry_run      = dry_run,
+                    is_final_bar = final_bar,
+                )
+            except Exception as exc:
+                logger.error("run_bar %d failed: %s", bar_idx, exc)
+
+            bar_idx += 1
+
+            # Step 5: sleep until the next 30-minute boundary
+            now        = _now_et()
+            next_bar   = _next_bar_time(now)
+            sleep_secs = max(0.0, (next_bar - now).total_seconds())
+
+            logger.info(
+                "Sleeping %.0f s until next bar at %s.",
+                sleep_secs, next_bar.strftime("%H:%M ET"),
             )
-        except Exception as exc:
-            logger.error("run_bar %d failed: %s", bar_idx, exc)
-
-        bar_idx += 1
-
-        # Step 5: sleep until the next 30-minute boundary
-        now        = _now_et()
-        next_bar   = _next_bar_time(now)
-        sleep_secs = max(0.0, (next_bar - now).total_seconds())
+            time.sleep(sleep_secs)
 
         logger.info(
-            "Sleeping %.0f s until next bar at %s.",
-            sleep_secs, next_bar.strftime("%H:%M ET"),
+            "=== Intraday runner finished after %d bar(s). ===", bar_idx
         )
-        time.sleep(sleep_secs)
-
-    logger.info(
-        "=== Intraday runner finished after %d bar(s). ===", bar_idx
-    )
+    finally:
+        release_run_lock()
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +471,7 @@ if __name__ == "__main__":
 
     log_dir = config.DATA_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"intraday_{datetime.now().strftime('%Y-%m-%d')}.log"
+    log_file = log_dir / f"intraday_{_now_et().strftime('%Y-%m-%d')}.log"
 
     logging.basicConfig(
         level=logging.INFO,

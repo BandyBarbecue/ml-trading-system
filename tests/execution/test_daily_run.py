@@ -9,15 +9,22 @@ Mocking strategy:
   them at their canonical import path (e.g. "src.data.fetch_prices.update_prices").
   We also patch the _today() helper to control the day-of-week / day-of-month
   seen by the orchestrator.
+
+  config.DATA_DIR is monkeypatched to a per-test tmp_path so the new
+  state-file interactions added for the kill-switch/halt/lock fixes
+  (risk_state.json, equity_curve.parquet, run.lock, target_weights.json)
+  never touch the real project data/ directory during a test run.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import MagicMock, patch, call
 
 import pandas as pd
 import pytest
+
+import config
 
 # We import the module under test early so that monkeypatching its _today
 # helper works correctly even when the module is already cached.
@@ -44,14 +51,23 @@ _FAKE_WEIGHTS = pd.Series({"AAPL": 0.6, "MSFT": 0.4}, name="weights")
 _FAKE_TRADES  = pd.Series({"AAPL": 0.6, "MSFT": 0.4}, name="trades")
 
 
-def _patch_all_steps(monkeypatch, *, monday=True, first_of_month=False,
+def _patch_all_steps(monkeypatch, tmp_path, *, monday=True, first_of_month=False,
                      model=None, scores=None, weights=None, trades=None):
     """
     Helper: monkeypatch every heavy import inside run_daily() with lightweight
     mocks, then return a dict of the mock objects so tests can assert on them.
 
     All data-fetch and ML functions become no-ops by default.
+
+    config.DATA_DIR is redirected to tmp_path so risk_state.json,
+    equity_curve.parquet, run.lock, and target_weights.json are all written
+    into an isolated per-test directory — the halt flag / lock / peak value
+    / etc. logic runs for REAL against tmp_path rather than being mocked
+    away, which gives genuine coverage of that plumbing while staying
+    completely isolated from the real project data/ directory.
     """
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
     # Pick the right date sentinel
     if monday and first_of_month:
         fake_date = FIRST_MONDAY
@@ -160,6 +176,7 @@ def _patch_all_steps(monkeypatch, *, monday=True, first_of_month=False,
         "predict":         mock_predict,
         "train":           mock_train,
         "load_latest_model": mock_load_mdl,
+        "load_latest_params": mock_load_params,
         "build_portfolio": mock_build_pf,
         "compute_trades":  mock_comp_tr,
         "submit_rebalance": mock_submit_rebalance,
@@ -171,9 +188,9 @@ def _patch_all_steps(monkeypatch, *, monday=True, first_of_month=False,
 # test_dry_run_skips_orders
 # ---------------------------------------------------------------------------
 
-def test_dry_run_skips_orders(monkeypatch):
+def test_dry_run_skips_orders(monkeypatch, tmp_path):
     """dry_run=True must produce an empty orders list and still reach step 7."""
-    mocks = _patch_all_steps(monkeypatch, monday=True)
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     result = daily_run_mod.run_daily(dry_run=True)
 
@@ -186,9 +203,9 @@ def test_dry_run_skips_orders(monkeypatch):
 # test_result_has_all_keys
 # ---------------------------------------------------------------------------
 
-def test_result_has_all_keys(monkeypatch):
+def test_result_has_all_keys(monkeypatch, tmp_path):
     """The returned dict must contain every documented key."""
-    _patch_all_steps(monkeypatch, monday=True)
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     result = daily_run_mod.run_daily(dry_run=True)
 
@@ -203,9 +220,9 @@ def test_result_has_all_keys(monkeypatch):
 # test_result_date_matches_today
 # ---------------------------------------------------------------------------
 
-def test_result_date_matches_today(monkeypatch):
+def test_result_date_matches_today(monkeypatch, tmp_path):
     """result['date'] must match the date returned by _today()."""
-    _patch_all_steps(monkeypatch, monday=True)
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     # _today is already patched to MONDAY_DATE = 2026-06-08
     result = daily_run_mod.run_daily(dry_run=True)
@@ -217,9 +234,9 @@ def test_result_date_matches_today(monkeypatch):
 # test_monday_triggers_portfolio_construction
 # ---------------------------------------------------------------------------
 
-def test_monday_triggers_portfolio_construction(monkeypatch):
+def test_monday_triggers_portfolio_construction(monkeypatch, tmp_path):
     """On a Monday, build_portfolio must be called."""
-    mocks = _patch_all_steps(monkeypatch, monday=True)
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     daily_run_mod.run_daily(dry_run=True)
 
@@ -230,9 +247,9 @@ def test_monday_triggers_portfolio_construction(monkeypatch):
 # test_non_monday_skips_portfolio
 # ---------------------------------------------------------------------------
 
-def test_non_monday_skips_portfolio(monkeypatch):
+def test_non_monday_skips_portfolio(monkeypatch, tmp_path):
     """On a Tuesday (or any non-Monday), build_portfolio must NOT be called."""
-    mocks = _patch_all_steps(monkeypatch, monday=False)
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=False)
 
     result = daily_run_mod.run_daily(dry_run=True)
 
@@ -245,9 +262,9 @@ def test_non_monday_skips_portfolio(monkeypatch):
 # test_first_of_month_triggers_retrain
 # ---------------------------------------------------------------------------
 
-def test_first_of_month_triggers_retrain(monkeypatch):
+def test_first_of_month_triggers_retrain(monkeypatch, tmp_path):
     """On the 1st of the month, train() must be called."""
-    mocks = _patch_all_steps(monkeypatch, monday=True, first_of_month=True)
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True, first_of_month=True)
 
     daily_run_mod.run_daily(dry_run=True)
 
@@ -255,14 +272,19 @@ def test_first_of_month_triggers_retrain(monkeypatch):
     # load_latest_model is also called (to check if existing model exists),
     # then train() is called for the retrain — both are correct
 
+    # #16(a): params=load_latest_params() must be passed through to train().
+    mocks["load_latest_params"].assert_called_once()
+    _, train_kwargs = mocks["train"].call_args
+    assert "params" in train_kwargs
+
 
 # ---------------------------------------------------------------------------
 # test_non_first_skips_retrain
 # ---------------------------------------------------------------------------
 
-def test_non_first_skips_retrain(monkeypatch):
+def test_non_first_skips_retrain(monkeypatch, tmp_path):
     """On a non-1st day, load_latest_model() must be called (not train)."""
-    mocks = _patch_all_steps(monkeypatch, monday=True, first_of_month=False)
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True, first_of_month=False)
 
     daily_run_mod.run_daily(dry_run=True)
 
@@ -274,9 +296,9 @@ def test_non_first_skips_retrain(monkeypatch):
 # test_live_run_submits_orders
 # ---------------------------------------------------------------------------
 
-def test_live_run_submits_orders(monkeypatch):
+def test_live_run_submits_orders(monkeypatch, tmp_path):
     """dry_run=False on a Monday with trades → submit_rebalance is called."""
-    mocks = _patch_all_steps(monkeypatch, monday=True)
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     result = daily_run_mod.run_daily(dry_run=False)
 
@@ -289,9 +311,9 @@ def test_live_run_submits_orders(monkeypatch):
 # test_step_counter_reaches_7
 # ---------------------------------------------------------------------------
 
-def test_step_counter_reaches_7(monkeypatch):
+def test_step_counter_reaches_7(monkeypatch, tmp_path):
     """After a clean run, step must equal 7 regardless of dry_run."""
-    _patch_all_steps(monkeypatch, monday=True)
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     result = daily_run_mod.run_daily(dry_run=True)
 
@@ -302,9 +324,9 @@ def test_step_counter_reaches_7(monkeypatch):
 # test_errors_key_empty_on_clean_run
 # ---------------------------------------------------------------------------
 
-def test_errors_key_empty_on_clean_run(monkeypatch):
+def test_errors_key_empty_on_clean_run(monkeypatch, tmp_path):
     """When all steps succeed, the errors list must be empty."""
-    _patch_all_steps(monkeypatch, monday=True)
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     result = daily_run_mod.run_daily(dry_run=True)
 
@@ -315,9 +337,9 @@ def test_errors_key_empty_on_clean_run(monkeypatch):
 # test_step1_failure_is_recorded_but_pipeline_continues
 # ---------------------------------------------------------------------------
 
-def test_step1_failure_is_recorded_but_pipeline_continues(monkeypatch):
+def test_step1_failure_is_recorded_but_pipeline_continues(monkeypatch, tmp_path):
     """If Step 1 (data fetch) raises, the error is captured but step 7 is reached."""
-    mocks = _patch_all_steps(monkeypatch, monday=True)
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     # Make update_prices raise
     mocks["update_prices"].side_effect = RuntimeError("Network down")
@@ -334,9 +356,9 @@ def test_step1_failure_is_recorded_but_pipeline_continues(monkeypatch):
 # test_scores_populated_when_model_available
 # ---------------------------------------------------------------------------
 
-def test_scores_populated_when_model_available(monkeypatch):
+def test_scores_populated_when_model_available(monkeypatch, tmp_path):
     """If a model is available, result['scores'] must be a non-None pd.Series."""
-    _patch_all_steps(monkeypatch, monday=True)
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
 
     result = daily_run_mod.run_daily(dry_run=True)
 
@@ -348,11 +370,111 @@ def test_scores_populated_when_model_available(monkeypatch):
 # test_weights_none_on_non_monday
 # ---------------------------------------------------------------------------
 
-def test_weights_none_on_non_monday(monkeypatch):
+def test_weights_none_on_non_monday(monkeypatch, tmp_path):
     """On a non-Monday, weights and trades must remain None (no rebalance)."""
-    _patch_all_steps(monkeypatch, monday=False)
+    _patch_all_steps(monkeypatch, tmp_path, monday=False)
 
     result = daily_run_mod.run_daily(dry_run=True)
 
     assert result["weights"] is None
     assert result["trades"]  is None
+
+
+# ---------------------------------------------------------------------------
+# test_target_weights_persisted_on_monday  (#15b wiring)
+# ---------------------------------------------------------------------------
+
+def test_target_weights_persisted_on_monday(monkeypatch, tmp_path):
+    """Step 5 must persist the final weights to target_weights.json so
+    intraday_runner.py can size against real HRP targets."""
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
+
+    daily_run_mod.run_daily(dry_run=True)
+
+    path = tmp_path / "target_weights.json"
+    assert path.exists()
+    import json
+    payload = json.loads(path.read_text())
+    assert payload["date"] == "2026-06-08"
+    assert payload["weights"] == {"AAPL": pytest.approx(0.6), "MSFT": pytest.approx(0.4)}
+
+
+# ---------------------------------------------------------------------------
+# Kill switch / halt / restart-safety  (#14)
+# ---------------------------------------------------------------------------
+
+def test_kill_switch_fires_on_real_loss_and_halts_and_blocks_restart(monkeypatch, tmp_path):
+    """A real -3% day (worse than DAILY_LOSS_LIMIT=2%) must trip the REAL
+    RiskEngine's kill switch, persist a halt flag for today, and a same-day
+    restart must then refuse to run at all — the core of the #14 fix."""
+    from src.risk.engine import RiskEngine as RealRiskEngine
+    from src.execution import equity_tracker, risk_state
+
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
+    # Use the REAL risk engine for this test instead of the base fixture's mock,
+    # so the kill switch's actual threshold logic is exercised.
+    monkeypatch.setattr("src.risk.engine.RiskEngine", RealRiskEngine)
+
+    # Seed "yesterday's" equity so today's daily P&L can be computed for real.
+    equity_tracker.update_equity(100_000.0, as_of=date(2026, 6, 5))
+    # Today's account value is down 3% from that — should trip the 2% kill switch.
+    monkeypatch.setattr(daily_run_mod, "_get_account_value", lambda: 97_000.0)
+
+    result = daily_run_mod.run_daily(dry_run=True)
+
+    assert any(d.get("action") == "kill_switch" for d in result["risk_decisions"]), (
+        f"Expected a kill_switch decision, got: {result['risk_decisions']}"
+    )
+    assert risk_state.is_halted("2026-06-08") is True
+
+    # A same-day restart (e.g. Task Scheduler retrying after a crash) must
+    # refuse to run at all.
+    result2 = daily_run_mod.run_daily(dry_run=True)
+    assert result2.get("halted") is True
+    assert result2["step"] == 0
+    assert any("halted" in e.lower() for e in result2["errors"])
+
+
+def test_no_kill_switch_no_halt_flag(monkeypatch, tmp_path):
+    """On an ordinary day (no loss), no halt flag should be recorded and a
+    second run on the same (fake) day should proceed normally."""
+    from src.execution import risk_state
+
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)  # default mock engine fires no decisions
+
+    daily_run_mod.run_daily(dry_run=True)
+
+    assert risk_state.is_halted("2026-06-08") is False
+
+    result2 = daily_run_mod.run_daily(dry_run=True)
+    assert "halted" not in result2
+    assert result2["step"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Run lock  (#18c)
+# ---------------------------------------------------------------------------
+
+def test_run_daily_refuses_to_start_while_lock_held(monkeypatch, tmp_path):
+    """If run.lock is already held by another (simulated) run, run_daily must
+    exit immediately without running any pipeline steps."""
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True)
+
+    from src.execution.paper_trader import acquire_run_lock
+    assert acquire_run_lock() is True  # simulate another run already in progress
+
+    result = daily_run_mod.run_daily(dry_run=True)
+
+    assert result["step"] == 0
+    assert any("lock" in e.lower() for e in result["errors"])
+    mocks["build_portfolio"].assert_not_called()
+
+
+def test_run_daily_releases_lock_after_completion(monkeypatch, tmp_path):
+    """After a normal run finishes, run.lock must be released so a subsequent
+    run can acquire it again."""
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
+
+    daily_run_mod.run_daily(dry_run=True)
+
+    assert not (tmp_path / "run.lock").exists()

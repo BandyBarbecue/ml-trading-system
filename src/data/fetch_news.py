@@ -90,9 +90,16 @@ def update_news(
     # Fan out items into (ticker, date) rows then group by date for saving.
     rows = []
     for item in news_items:
-        pub_date = pd.Timestamp(item.created_at).normalize()
-        if pub_date.tzinfo is not None:
-            pub_date = pub_date.tz_localize(None)
+        # Alpaca's created_at is UTC. Bucketing on the raw UTC calendar date
+        # would push anything published after ~20:00 ET (market close + a
+        # few hours) into the *next* trading day's file — e.g. an article at
+        # 2024-01-03 01:00 UTC is really 2024-01-02 20:00 ET and belongs with
+        # Jan 2's news. So we convert to US/Eastern BEFORE taking the date,
+        # same pattern as fetch_intraday.py's tz handling.
+        ts = pd.Timestamp(item.created_at)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")  # defensive: assume UTC if tz-naive input slips through
+        pub_date = ts.tz_convert("US/Eastern").normalize().tz_localize(None)
         date_str = pub_date.strftime("%Y-%m-%d")
         # summary may be absent on older SDK versions or stub objects in tests.
         # getattr returns None/MagicMock when missing, so we guard with isinstance.

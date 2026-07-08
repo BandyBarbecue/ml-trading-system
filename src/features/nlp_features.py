@@ -277,17 +277,34 @@ def _aggregate_scores(
                 continue
 
             pub_ts = pd.Timestamp(pub)
-            # Normalise to midnight and strip timezone so arithmetic works regardless
-            # of whether the publication timestamp is tz-aware (UTC from Alpaca) or
-            # d is a tz-naive Timestamp (from pd.bdate_range).
-            pub_date = pub_ts.normalize()
-            if pub_date.tzinfo is not None:
-                pub_date = pub_date.tz_localize(None)
+            # fetch_news stores Alpaca timestamps, which are UTC. Defensively
+            # assume UTC if we ever see a tz-naive timestamp (e.g. from an
+            # older cache) so the ET conversion below is still correct.
+            if pub_ts.tzinfo is None:
+                pub_ts = pub_ts.tz_localize("UTC")
+            pub_et = pub_ts.tz_convert("US/Eastern")
+
+            # US equity markets close at 16:00 ET. A headline published after
+            # that cutoff was not public before that trading day's close, so
+            # it can't be "today's" news for feature purposes — it belongs to
+            # the NEXT calendar day's window. Without this, a 17:15 ET
+            # headline would count at 2x strength for a day whose close had
+            # already happened before the news broke (look-ahead bias).
+            close_cutoff = pub_et.normalize() + pd.Timedelta(hours=16)
+            if pub_et >= close_cutoff:
+                effective_date = pub_et.normalize() + pd.Timedelta(days=1)
+            else:
+                effective_date = pub_et.normalize()
+            # Strip timezone so arithmetic works against d, which is a
+            # tz-naive Timestamp (from pd.bdate_range).
+            effective_date = effective_date.tz_localize(None)
+
             d_naive = pd.Timestamp(d)
             if d_naive.tzinfo is not None:
                 d_naive = d_naive.tz_localize(None)
-            # days_ago: how many calendar days before date d was this published?
-            days_ago = (d_naive - pub_date).days
+            # days_ago: how many calendar days before date d does the
+            # effective (post-close-cutoff-adjusted) news date fall?
+            days_ago = (d_naive - effective_date).days
 
             # Skip headlines that haven't happened yet (future) or are too old.
             if days_ago < 0 or days_ago >= NLP_DECAY_DAYS:
@@ -314,7 +331,12 @@ def _aggregate_scores(
             # Supply-chain / peer effects: each affected ticker gets a secondary
             # score.  We scale by 0.5 (second-order effect is weaker) and adjust
             # the sign based on the affected ticker's own direction.
-            for affected in sig.get("affected_tickers", []):
+            # sig.get(..., []) only supplies the default when the key is
+            # MISSING — if Claude returns "affected_tickers": null, .get()
+            # happily returns None and the for-loop below crashes with a
+            # TypeError. `or []` catches both the missing-key and
+            # explicit-null cases.
+            for affected in (sig.get("affected_tickers") or []):
                 at = affected.get("ticker", "")
                 if not at:
                     continue

@@ -75,11 +75,37 @@ def make_feature_matrix(
 
 
 def make_sector_map(feature_matrix: pd.DataFrame) -> dict[str, str]:
-    """Assign a trivial sector to every ticker in the matrix."""
+    """Assign a trivial sector to every ticker in the matrix.
+
+    Uses FOUR dummy sectors, not two: with MAX_SECTOR_PCT = 0.30 the sector
+    cap is only satisfiable when there are at least ceil(1 / 0.30) = 4
+    sectors — k sectors can hold at most k x 30% of the book, so a 2-sector
+    universe can never sum to 100% under a 30% cap. _apply_sector_cap now
+    asserts convergence instead of silently renormalising the cap away, so
+    an infeasible fixture universe would crash every rebalance.
+    """
     tickers = feature_matrix["ticker"].unique().tolist()
-    # Spread them evenly across two dummy sectors so sector caps are reachable.
-    sectors = ["SectorA", "SectorB"]
-    return {t: sectors[i % 2] for i, t in enumerate(tickers)}
+    sectors = ["SectorA", "SectorB", "SectorC", "SectorD"]
+    return {t: sectors[i % 4] for i, t in enumerate(tickers)}
+
+
+def make_close_prices(feature_matrix: pd.DataFrame, seed: int = 7) -> pd.DataFrame:
+    """Build a synthetic (date x ticker) close-price panel for run_backtest()'s
+    `close_prices` parameter, covering every date/ticker in feature_matrix.
+
+    run_backtest() now computes daily P&L from real close-to-close returns
+    (see src/backtest/run_backtest.py) instead of the `target` column, so it
+    needs an actual price panel. In production this comes from
+    data/prices/<TICKER>.parquet; in tests we inject a synthetic geometric
+    random walk instead — the exact price path doesn't matter, only that it
+    is genuine day-over-day price data.
+    """
+    rng = np.random.default_rng(seed)
+    dates = sorted(feature_matrix["date"].unique())
+    tickers = sorted(feature_matrix["ticker"].unique())
+    daily_rets = rng.normal(loc=0.0003, scale=0.01, size=(len(dates), len(tickers)))
+    prices = 100.0 * np.cumprod(1 + daily_rets, axis=0)
+    return pd.DataFrame(prices, index=pd.DatetimeIndex(dates), columns=tickers)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +148,10 @@ class TestEquityCurveLength:
         monkeypatch.setattr("src.backtest.run_backtest.train", _mock_train)
         monkeypatch.setattr("src.backtest.run_backtest.predict", _mock_predict)
 
-        result = run_backtest(fm, sector_map, initial_value=100_000.0, log_path=tmp_path / "decisions.jsonl")
+        result = run_backtest(
+            fm, sector_map, initial_value=100_000.0, log_path=tmp_path / "decisions.jsonl",
+            close_prices=make_close_prices(fm),
+        )
         eq = result["equity_curve"]
 
         # Calculate expected number of test-window days.
@@ -177,7 +206,10 @@ class TestNoDataLeakage:
         monkeypatch.setattr("src.backtest.run_backtest.train", recording_train)
         monkeypatch.setattr("src.backtest.run_backtest.predict", _mock_predict)
 
-        run_backtest(fm, sector_map, initial_value=100_000.0, log_path=tmp_path / "decisions.jsonl")
+        run_backtest(
+            fm, sector_map, initial_value=100_000.0, log_path=tmp_path / "decisions.jsonl",
+            close_prices=make_close_prices(fm),
+        )
 
         assert len(leakage_log) > 0, "No training calls were recorded — check test setup."
 
@@ -186,6 +218,81 @@ class TestNoDataLeakage:
                 f"LEAKAGE: training max date {train_max} is NOT strictly less than "
                 f"test start {test_start}."
             )
+
+
+# ---------------------------------------------------------------------------
+# Test: NO look-ahead in the P&L path (real returns + one-day fill lag)
+# ---------------------------------------------------------------------------
+
+class TestNoPriceLookaheadInPnL:
+    """The equity curve at day T must be identical no matter what prices do
+    strictly AFTER day T.
+
+    This is the P&L-path counterpart to TestNoDataLeakage above, which only
+    covers the model's train/test split. It catches two distinct bugs a
+    model-split-only check cannot see:
+      1. Using the (20-day-forward) `target` column as "today's return" —
+         that literally reads future prices into today's equity value.
+      2. Same-day fills — earning day T's return on weights decided from
+         day T's own close, instead of lagging them to day T+1.
+    If either bug were reintroduced, changing prices after day T would
+    change the equity value AT day T (or earlier), because the future price
+    change would (directly or indirectly, via a different `target` rank)
+    feed into a decision or return that lands on/before T.
+    """
+
+    def test_perturbing_future_prices_does_not_change_past_equity(self, monkeypatch, tmp_path):
+        fm = make_feature_matrix(n_dates=600, n_tickers=5)
+        sector_map = make_sector_map(fm)
+
+        monkeypatch.setattr("src.backtest.run_backtest.train", _mock_train)
+        monkeypatch.setattr("src.backtest.run_backtest.predict", _mock_predict)
+
+        all_dates = sorted(fm["date"].unique())
+        # T is a day inside the first test window (which starts at index
+        # MODEL_TRAIN_DAYS = 504), with plenty of test-window days both
+        # before and after it.
+        t_index = config.MODEL_TRAIN_DAYS + 15
+        day_t = all_dates[t_index]
+
+        prices_a = make_close_prices(fm, seed=7)
+        prices_b = prices_a.copy()
+        # Perturb prices STRICTLY AFTER day_t only — a large, obviously
+        # different shock, so any leakage would show up unmistakably.
+        future_mask = prices_b.index > day_t
+        prices_b.loc[future_mask] = prices_b.loc[future_mask] * 5.0 + 17.0
+
+        result_a = run_backtest(
+            fm, sector_map, initial_value=100_000.0,
+            log_path=tmp_path / "decisions_a.jsonl", close_prices=prices_a,
+        )
+        result_b = run_backtest(
+            fm, sector_map, initial_value=100_000.0,
+            log_path=tmp_path / "decisions_b.jsonl", close_prices=prices_b,
+        )
+
+        eq_a = result_a["equity_curve"]
+        eq_b = result_b["equity_curve"]
+
+        # Every day up to and including day_t must be untouched by the
+        # future price shock.
+        past_and_present = eq_a.index[eq_a.index <= day_t]
+        assert len(past_and_present) > 1, "Test setup produced no pre-T equity history."
+        pd.testing.assert_series_equal(
+            eq_a.loc[past_and_present],
+            eq_b.loc[past_and_present],
+            check_exact=False,
+            atol=1e-6,
+        )
+
+        # Sanity check the perturbation actually DOES matter later on —
+        # otherwise this test would trivially pass even with the old bugs.
+        after = eq_a.index[eq_a.index > day_t]
+        assert len(after) > 0, "Test setup produced no post-T equity history."
+        assert not np.allclose(eq_a.loc[after].values, eq_b.loc[after].values), (
+            "Perturbing future prices had no effect anywhere — the P&L path "
+            "may not be using close_prices at all."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +311,10 @@ class TestMetricsShape:
         monkeypatch.setattr("src.backtest.run_backtest.train", _mock_train)
         monkeypatch.setattr("src.backtest.run_backtest.predict", _mock_predict)
 
-        result = run_backtest(fm, sector_map, initial_value=100_000.0, log_path=tmp_path / "decisions.jsonl")
+        result = run_backtest(
+            fm, sector_map, initial_value=100_000.0, log_path=tmp_path / "decisions.jsonl",
+            close_prices=make_close_prices(fm),
+        )
 
         missing = self.REQUIRED_KEYS - set(result.keys())
         assert not missing, f"Missing keys in result dict: {missing}"
@@ -217,7 +327,10 @@ class TestMetricsShape:
         monkeypatch.setattr("src.backtest.run_backtest.train", _mock_train)
         monkeypatch.setattr("src.backtest.run_backtest.predict", _mock_predict)
 
-        result = run_backtest(fm, sector_map, initial_value=100_000.0, log_path=tmp_path / "decisions.jsonl")
+        result = run_backtest(
+            fm, sector_map, initial_value=100_000.0, log_path=tmp_path / "decisions.jsonl",
+            close_prices=make_close_prices(fm),
+        )
 
         assert isinstance(result["equity_curve"], pd.Series)
         assert isinstance(result["sharpe"], float)
@@ -243,7 +356,8 @@ class TestPositiveInitialValue:
         start_capital = 50_000.0
         result = run_backtest(
             fm, sector_map, initial_value=start_capital,
-            log_path=tmp_path / "decisions.jsonl"
+            log_path=tmp_path / "decisions.jsonl",
+            close_prices=make_close_prices(fm),
         )
 
         # The equity curve's first value is recorded on the first test-window day.
@@ -261,7 +375,10 @@ class TestPositiveInitialValue:
         monkeypatch.setattr("src.backtest.run_backtest.train", _mock_train)
         monkeypatch.setattr("src.backtest.run_backtest.predict", _mock_predict)
 
-        result = run_backtest(fm, sector_map, log_path=tmp_path / "decisions.jsonl")
+        result = run_backtest(
+            fm, sector_map, log_path=tmp_path / "decisions.jsonl",
+            close_prices=make_close_prices(fm),
+        )
 
         assert abs(result["equity_curve"].iloc[0] - 100_000.0) < 1.0
 

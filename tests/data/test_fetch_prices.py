@@ -61,3 +61,39 @@ def test_no_duplicates_on_rerun(tmp_path, monkeypatch):
         fetch_prices.update_prices(symbols=["AAPL"])
     df = pd.read_parquet(tmp_path / "AAPL.parquet")
     assert df.index.duplicated().sum() == 0
+
+
+def test_fetch_symbol_returns_none_on_exception():
+    """A fetch failure (network error, bad symbol, outage) must return None,
+    not an empty DataFrame — empty is reserved for "legitimately no new
+    data" so the two cases stay distinguishable to the caller."""
+    from src.data.fetch_prices import fetch_symbol
+    mock_client = MagicMock()
+    mock_client.get_stock_bars.side_effect = Exception("simulated API outage")
+    result = fetch_symbol(mock_client, "AAPL", "2024-01-02", "2024-01-03")
+    assert result is None
+
+
+def test_update_prices_reports_failed_tickers(tmp_path, monkeypatch, capsys):
+    """A ticker whose fetch raises should be summarised in a warning line,
+    not silently skipped like an up-to-date ticker would be."""
+    from src.data import fetch_prices
+    monkeypatch.setattr(fetch_prices, "PRICES_DIR", tmp_path)
+
+    def fake_fetch_symbol(client, ticker, start, end):
+        if ticker == "BADTICKER":
+            return None
+        return make_mock_bars(ticker, ["2024-01-02"]).df.droplevel(0)
+
+    mock_client = MagicMock()
+    with patch.object(fetch_prices, "_make_client", return_value=mock_client), \
+         patch.object(fetch_prices, "fetch_symbol", side_effect=fake_fetch_symbol):
+        fetch_prices.update_prices(symbols=["AAPL", "BADTICKER"])
+
+    # The healthy ticker still gets written...
+    assert (tmp_path / "AAPL.parquet").exists()
+    # ...but the failed one does not, and shows up in a printed summary.
+    assert not (tmp_path / "BADTICKER.parquet").exists()
+    captured = capsys.readouterr()
+    assert "BADTICKER" in captured.out
+    assert "failed to fetch" in captured.out

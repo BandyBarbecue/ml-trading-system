@@ -190,6 +190,10 @@ def test_submit_rebalance_sell():
 
     Math: delta=-0.05, account=$100,000 → $5,000 to sell.
           price (bid)=$200/share → 5,000/200 = 25.0 → floor = 25 shares.
+
+    We hold well over 25 shares of MSFT here so the oversell clamp (task #18)
+    doesn't interfere with this test — that behaviour has its own dedicated
+    tests below.
     """
     from src.execution.paper_trader import submit_rebalance
     from alpaca.trading.enums import OrderSide
@@ -203,6 +207,8 @@ def test_submit_rebalance_sell():
 
     client = MagicMock()
     client.submit_order.return_value = mock_order
+    client.get_all_positions.return_value = [_mock_position("MSFT", 40_000.0)]
+    client.get_all_positions.return_value[0].qty = "200"  # comfortably more than 25
 
     trade_deltas = pd.Series({"MSFT": -0.05})
     with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
@@ -281,3 +287,167 @@ def test_submit_rebalance_skips_on_quote_error():
 
     assert results == []
     client.submit_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# test_submit_rebalance_clamps_oversell  (#18a)
+# ---------------------------------------------------------------------------
+
+def test_submit_rebalance_clamps_oversell():
+    """A SELL delta implying more shares than we actually hold is clamped to
+    the held quantity, never opening an accidental short.
+
+    Setup: delta=-0.10 on a $100k account, price=$100 → naive calc wants to
+    sell 100 shares, but we only hold 10.
+    """
+    from src.execution.paper_trader import submit_rebalance
+    from alpaca.trading.enums import OrderSide
+
+    quote = _mock_quote(ask_price=101.0, bid_price=100.0)
+    mock_quote_response = {"AAPL": quote}
+
+    mock_order = MagicMock()
+    mock_order.id = "order-clamp-1"
+    mock_order.status = "accepted"
+
+    client = MagicMock()
+    client.submit_order.return_value = mock_order
+    held_pos = _mock_position("AAPL", 1_000.0)
+    held_pos.qty = "10"
+    client.get_all_positions.return_value = [held_pos]
+
+    trade_deltas = pd.Series({"AAPL": -0.10})
+    with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
+        mock_data_fn.return_value.get_stock_latest_quote.return_value = mock_quote_response
+        results = submit_rebalance(client, trade_deltas, account_value=100_000.0)
+
+    assert len(results) == 1
+    assert results[0]["shares"] == 10, "SELL must be clamped to the 10 shares actually held"
+    submitted_request = client.submit_order.call_args[0][0]
+    assert submitted_request.qty == 10
+    assert submitted_request.side == OrderSide.SELL
+
+
+def test_submit_rebalance_sell_skipped_when_nothing_held():
+    """A SELL delta for a ticker we don't hold at all is clamped to 0 shares
+    (skipped entirely) rather than opening a naked short."""
+    from src.execution.paper_trader import submit_rebalance
+
+    quote = _mock_quote(ask_price=51.0, bid_price=50.0)
+    mock_quote_response = {"GHOST": quote}
+
+    client = MagicMock()
+    client.get_all_positions.return_value = []  # we hold nothing
+
+    trade_deltas = pd.Series({"GHOST": -0.05})
+    with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
+        mock_data_fn.return_value.get_stock_latest_quote.return_value = mock_quote_response
+        results = submit_rebalance(client, trade_deltas, account_value=100_000.0)
+
+    assert results == []
+    client.submit_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# test_submit_rebalance_skips_open_order  (#18b)
+# ---------------------------------------------------------------------------
+
+def test_submit_rebalance_skips_open_order():
+    """If an open order already exists for a symbol, submit_rebalance skips it
+    instead of submitting a duplicate."""
+    from src.execution.paper_trader import submit_rebalance
+
+    client = MagicMock()
+    client.get_orders.return_value = [MagicMock()]  # one open order already exists
+    client.get_all_positions.return_value = []
+
+    trade_deltas = pd.Series({"AAPL": 0.05})
+    results = submit_rebalance(client, trade_deltas, account_value=100_000.0)
+
+    assert results == []
+    client.submit_order.assert_not_called()
+
+
+def test_submit_rebalance_open_order_check_failure_does_not_block():
+    """If checking for open orders raises (API hiccup), the order is still
+    submitted rather than the whole rebalance being killed."""
+    from src.execution.paper_trader import submit_rebalance
+
+    quote = _mock_quote(ask_price=100.0, bid_price=99.0)
+    mock_quote_response = {"AAPL": quote}
+
+    mock_order = MagicMock()
+    mock_order.id = "order-1"
+    mock_order.status = "accepted"
+
+    client = MagicMock()
+    client.get_orders.side_effect = RuntimeError("API hiccup")
+    client.get_all_positions.return_value = []
+    client.submit_order.return_value = mock_order
+
+    trade_deltas = pd.Series({"AAPL": 0.10})
+    with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
+        mock_data_fn.return_value.get_stock_latest_quote.return_value = mock_quote_response
+        results = submit_rebalance(client, trade_deltas, account_value=100_000.0)
+
+    assert len(results) == 1
+    client.submit_order.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# test run lock (#18c)
+# ---------------------------------------------------------------------------
+
+def test_acquire_run_lock_creates_file(tmp_path, monkeypatch):
+    """acquire_run_lock() creates data/run.lock with pid + ISO timestamp."""
+    import config
+    from src.execution import paper_trader
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    assert paper_trader.acquire_run_lock() is True
+
+    lock_path = tmp_path / "run.lock"
+    assert lock_path.exists()
+    import json
+    payload = json.loads(lock_path.read_text())
+    assert "pid" in payload and "timestamp" in payload
+
+    paper_trader.release_run_lock()
+    assert not lock_path.exists()
+
+
+def test_second_run_refused_while_lock_held(tmp_path, monkeypatch):
+    """A second acquire_run_lock() call while the first lock is fresh returns False."""
+    import config
+    from src.execution import paper_trader
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    assert paper_trader.acquire_run_lock() is True
+    # Second call, lock still held and fresh → must be refused.
+    assert paper_trader.acquire_run_lock() is False
+
+    paper_trader.release_run_lock()
+    # After release, a new run can acquire the lock again.
+    assert paper_trader.acquire_run_lock() is True
+    paper_trader.release_run_lock()
+
+
+def test_stale_lock_is_reclaimed(tmp_path, monkeypatch):
+    """A lock older than the staleness window is reclaimed, not treated as live."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    import config
+    from src.execution import paper_trader
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    lock_path = tmp_path / "run.lock"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    stale_time = datetime.now(timezone.utc) - timedelta(hours=3)  # > 2h staleness window
+    lock_path.write_text(json.dumps({"pid": 99999, "timestamp": stale_time.isoformat()}))
+
+    # Even though a lock file exists, it's stale → must be reclaimed (True).
+    assert paper_trader.acquire_run_lock() is True
+    paper_trader.release_run_lock()

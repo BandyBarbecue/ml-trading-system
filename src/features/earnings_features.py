@@ -61,11 +61,20 @@ def compute_sue(earnings: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFrame
     for d in dates:
         row: dict[str, float] = {}
         for ticker in tickers:
-            # All earnings for this ticker up to and including date d,
+            # All earnings for this ticker strictly BEFORE date d (not <=),
             # sorted newest-first so iloc[0] is the most recent report.
+            # Why strict "<": most S&P 500 companies report earnings After
+            # Market Close (AMC), so a report dated day T is not public
+            # information until day T+1's session. Using "<=" would let day
+            # T's own announcement leak into day T's feature (look-ahead
+            # bias) at full decay strength (days_since == 0 → decay 1.0).
+            # A proper fix would track a real BMO/AMC flag per report and
+            # only exclude same-day AMC reports — that's a future improvement;
+            # excluding the whole announcement day is the conservative, safe
+            # default in the meantime.
             hist = (
                 earnings[
-                    (earnings["ticker"] == ticker) & (earnings["date"] <= d)
+                    (earnings["ticker"] == ticker) & (earnings["date"] < d)
                 ]
                 .sort_values("date", ascending=False)
             )

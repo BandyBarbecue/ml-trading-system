@@ -28,15 +28,22 @@ def fetch_symbol(
     ticker: str,
     start: str,
     end: str,
-) -> pd.DataFrame:
+) -> pd.DataFrame | None:
     """Fetch adjusted daily bars for one symbol.
 
     The Alpaca SDK returns a DataFrame with a MultiIndex (symbol, timestamp).
     We drop the symbol level so the result is indexed by timestamp only —
     simpler to work with downstream.
 
-    Returns an empty DataFrame (not raises) on any failure so a bad symbol
-    never aborts the whole batch.
+    Returns:
+        - An *empty* DataFrame when Alpaca legitimately has nothing new
+          (e.g. we're already caught up to today).
+        - None when the fetch itself failed (network error, API outage, bad
+          symbol). This is deliberately distinguishable from "empty" — an
+          empty DataFrame used to double as "failed", which meant an outage
+          looked identical to "already up to date" and update_prices() would
+          silently stop updating without telling anyone.
+        Never raises — a bad symbol never aborts the whole batch.
     """
     try:
         req = StockBarsRequest(
@@ -58,7 +65,7 @@ def fetch_symbol(
         return df
     except Exception as exc:
         print(f"  [warn] {ticker}: {exc}")
-        return pd.DataFrame()
+        return None
 
 
 def update_prices(symbols: list[str] | None = None) -> None:
@@ -70,6 +77,10 @@ def update_prices(symbols: list[str] | None = None) -> None:
       next calendar day onwards — that way we never re-download old bars.
     - After fetching, concatenate old + new, deduplicate (keep the newest
       version of any duplicated row), sort, and write back to parquet.
+
+    Fetch failures (network error, API outage) are tracked separately from
+    "legitimately no new data" and summarised in a warning line at the end,
+    so an outage is visible instead of silently looking like nothing changed.
     """
     from src.data.sp500_universe import get_symbols
 
@@ -78,6 +89,8 @@ def update_prices(symbols: list[str] | None = None) -> None:
 
     if symbols is None:
         symbols = get_symbols()
+
+    failed_tickers: list[str] = []
 
     for ticker in symbols:
         path = PRICES_DIR / f"{ticker}.parquet"
@@ -92,6 +105,11 @@ def update_prices(symbols: list[str] | None = None) -> None:
             start = START_DATE
 
         new_data = fetch_symbol(client, ticker, start, END_DATE)
+        if new_data is None:
+            # The fetch itself failed — remember it so we can warn below,
+            # rather than silently treating an outage as "up to date".
+            failed_tickers.append(ticker)
+            continue
         if new_data.empty:
             # Nothing new to add — file (if it existed) is already up to date
             continue
@@ -106,6 +124,11 @@ def update_prices(symbols: list[str] | None = None) -> None:
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
         combined.to_parquet(path)
         print(f"{ticker}: {len(combined)} rows")
+
+    if failed_tickers:
+        preview = ", ".join(failed_tickers[:5])
+        more = f" (+{len(failed_tickers) - 5} more)" if len(failed_tickers) > 5 else ""
+        print(f"[warn] {len(failed_tickers)} ticker(s) failed to fetch: {preview}{more}")
 
 
 def load_prices(ticker: str) -> pd.DataFrame:

@@ -8,12 +8,30 @@ out. The strategy has no say — the engine's veto is final.
 Controls applied in order
 --------------------------
 1. Kill switch      — daily loss too severe → zero all weights.
-2. Drawdown cap     — portfolio too far below its peak → halve all weights.
-3. VIX regime       — market fear is extreme → halve all weights.
-4. Position veto    — any single weight over the per-stock limit → clip it.
-5. Re-normalise     — make surviving weights sum back to 1.0.
+2. Normalise        — proposed weights are scaled to sum to 1.0 (long-only
+                       only — see the note beside the guard below) so every
+                       control after this point works off a consistent budget.
+3. Position cap     — no single weight may exceed MAX_POSITION_PCT. Excess is
+                       redistributed to tickers still under the cap, iterating
+                       until nothing is left to redistribute (or a safety
+                       iteration limit), then a final hard clip.
+4. Drawdown cap     — portfolio too far below its peak → scale ALL weights by
+                       DRAWDOWN_SCALE_FACTOR.
+5. VIX regime       — market fear is extreme → scale ALL weights by
+                       VIX_SCALE_FACTOR.
+6. Gross exposure cap (long-short only) — cap long+|short| exposure.
 
-Every triggered control is logged as a JSON line to decisions.jsonl.
+Critically, steps 4 and 5 are applied LAST and are NEVER renormalised back to
+sum to 1.0 afterwards. A sum < 1.0 after de-risking means the remainder sits
+in cash — that is the entire point of a drawdown/VIX scale-down. An earlier
+version of this engine renormalised at the very end, which silently undid
+every scale-down and clip above it (proof: 20% drawdown + VIX 35 + an
+oversized position produced output weights identical to the input). Don't
+reintroduce a final renormalisation.
+
+Every triggered control is logged as a JSON line to decisions.jsonl, all
+using the "action" key (previously the gross-exposure-cap entry used
+"control"/"triggered" instead, which made the log schema inconsistent).
 """
 
 import json
@@ -114,26 +132,58 @@ class RiskEngine:
                 "limit": config.DAILY_LOSS_LIMIT,
             }))
 
-        # ----------------------------------------------------------
-        # 2. Drawdown cap — portfolio too far below its peak
-        # ----------------------------------------------------------
-        # Drawdown is positive when we are below peak.
         if not kill_switch_fired:
+            # ------------------------------------------------------
+            # 2. Normalise proposed weights to sum to 1.0 — FIRST, before
+            #    any cap or scale, so those controls act on a consistent
+            #    1.0 budget rather than whatever the strategy handed us.
+            #
+            #    Skipped for long-short portfolios. In a mixed long/short
+            #    book, weights.sum() equals (long exposure - short exposure)
+            #    which is the *net* exposure, not the gross. Dividing by a
+            #    net < 1 inflates every absolute weight and can push gross
+            #    exposure above GROSS_EXPOSURE_CAP, defeating step 6.
+            #
+            #    Example: 120% long + 30% short → sum = 0.90, gross = 1.50.
+            #    Dividing by 0.90 → gross becomes 1.667, exceeding a 1.60 cap.
+            #
+            #    The gross-exposure cap in step 6 already handles scaling for
+            #    long-short portfolios, so this step is skipped for them.
+            # ------------------------------------------------------
+            if not config.LONG_SHORT_ENABLED:
+                total = float(weights.sum())
+                if total > 0.0:
+                    weights = weights / total
+
+            # ------------------------------------------------------
+            # 3. Position limit veto — clip any over-weight single stock,
+            #    redistributing the clipped excess to tickers still under
+            #    the cap (iterating so redistribution itself can't create a
+            #    new breach), then a final hard safety clip.
+            # ------------------------------------------------------
+            weights = self._apply_position_cap(weights, decisions)
+
+            # ------------------------------------------------------
+            # 4. Drawdown cap — portfolio too far below its peak.
+            #    Drawdown is positive when we are below peak.
+            #    Multiplicative scale, no renormalisation after — the
+            #    shortfall is intentionally left un-invested (held as cash).
+            # ------------------------------------------------------
             drawdown = (peak_value - current_value) / peak_value
             if drawdown >= config.MAX_DRAWDOWN:
-                weights *= config.VIX_SCALE_FACTOR
+                weights = weights * config.DRAWDOWN_SCALE_FACTOR
                 decisions.append(self._log({
                     "action": "drawdown_scale",
                     "drawdown": drawdown,
-                    "scale_factor": config.VIX_SCALE_FACTOR,
+                    "scale_factor": config.DRAWDOWN_SCALE_FACTOR,
                 }))
 
-        # ----------------------------------------------------------
-        # 3. VIX regime filter — market is too fearful
-        # ----------------------------------------------------------
-        if not kill_switch_fired:
+            # ------------------------------------------------------
+            # 5. VIX regime filter — market is too fearful.
+            #    Same rule: multiplicative, no renormalisation after.
+            # ------------------------------------------------------
             if vix > config.VIX_REGIME_THRESHOLD:
-                weights *= config.VIX_SCALE_FACTOR
+                weights = weights * config.VIX_SCALE_FACTOR
                 decisions.append(self._log({
                     "action": "vix_scale",
                     "vix": vix,
@@ -141,62 +191,25 @@ class RiskEngine:
                     "scale_factor": config.VIX_SCALE_FACTOR,
                 }))
 
-        # ----------------------------------------------------------
-        # 4. Position limit veto — clip any over-weight single stock
-        # ----------------------------------------------------------
-        if not kill_switch_fired:
-            for ticker in weights.index:
-                original = float(weights[ticker])
-                if original > config.MAX_POSITION_PCT:
-                    weights[ticker] = config.MAX_POSITION_PCT
+            # ------------------------------------------------------
+            # 6. Gross exposure cap (only when long-short is enabled)
+            #    Gross exposure = sum of absolute weights (long + |short|).
+            #    If the combined exposure would exceed GROSS_EXPOSURE_CAP,
+            #    scale every weight down proportionally so the cap is met
+            #    exactly. No renormalisation follows this either.
+            # ------------------------------------------------------
+            if config.LONG_SHORT_ENABLED:
+                gross = float(weights.abs().sum())
+                cap   = config.GROSS_EXPOSURE_CAP
+                if gross > cap:
+                    scale = cap / gross
+                    weights = (weights * scale).round(6)
                     decisions.append(self._log({
-                        "action": "position_veto",
-                        "ticker": ticker,
-                        "original": original,
-                        "clipped_to": config.MAX_POSITION_PCT,
+                        "action":  "gross_exposure_cap",
+                        "gross":   round(gross, 4),
+                        "scale":   round(scale, 4),
+                        "cap":     cap,
                     }))
-
-        # ----------------------------------------------------------
-        # 5. Gross exposure cap (only when long-short is enabled)
-        #    Gross exposure = sum of absolute weights (long + |short|).
-        #    If the combined exposure would exceed GROSS_EXPOSURE_CAP, scale
-        #    every weight down proportionally so the cap is met exactly.
-        # ----------------------------------------------------------
-        if config.LONG_SHORT_ENABLED and not kill_switch_fired:
-            gross = float(weights.abs().sum())
-            cap   = config.GROSS_EXPOSURE_CAP
-            if gross > cap:
-                scale = cap / gross
-                weights = (weights * scale).round(6)
-                decisions.append(self._log({
-                    "control":   "gross_exposure_cap",
-                    "triggered": True,
-                    "gross":     round(gross, 4),
-                    "scale":     round(scale, 4),
-                    "cap":       cap,
-                }))
-
-        # ----------------------------------------------------------
-        # 6. Re-normalise (long-only only)
-        #    For long-only portfolios, weights should sum to 1.0, so we
-        #    divide by the total to restore that invariant after clipping.
-        #
-        #    For long-short portfolios we must NOT do this.  In a mixed
-        #    long/short book, weights.sum() equals (long exposure - short
-        #    exposure) which is the *net* exposure, not the gross.  Dividing
-        #    by a net < 1 inflates every absolute weight and can push gross
-        #    exposure above GROSS_EXPOSURE_CAP, defeating step 5.
-        #
-        #    Example: 120% long + 30% short → sum = 0.90, gross = 1.50.
-        #    Dividing by 0.90 → gross becomes 1.667, exceeding a 1.60 cap.
-        #
-        #    The gross-exposure cap in step 5 already handles scaling for
-        #    long-short portfolios, so no further normalisation is needed.
-        # ----------------------------------------------------------
-        if not kill_switch_fired and not config.LONG_SHORT_ENABLED:
-            total = float(weights.sum())
-            if total > 0.0:
-                weights = weights / total
 
         return weights, decisions
 
@@ -217,6 +230,67 @@ class RiskEngine:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _apply_position_cap(self, weights: pd.Series, decisions: list[dict]) -> pd.Series:
+        """Clip any weight over MAX_POSITION_PCT and redistribute the excess.
+
+        Analogy: think of the cap as a glass that can only hold so much
+        water (8%). Whatever overflows one glass gets poured into glasses
+        that still have room, not just thrown away — but a glass that's
+        already full can't take on more, so we keep pouring in rounds until
+        either everything fits or every glass is completely full (at which
+        point the remainder has nowhere to go and is simply left unassigned
+        — that money is later left in cash rather than force-fit anywhere).
+
+        A single pass isn't enough: redistributing excess to tickers under
+        the cap can itself push one of them over, so we iterate until
+        nothing is left over the cap (or a safety limit is hit), then apply
+        one final hard clip so the invariant "nothing exceeds the cap" holds
+        even if float drift or the iteration limit left a sliver over.
+        """
+        w = weights.copy()
+        cap = config.MAX_POSITION_PCT
+        # Tiny tolerance: the normalise-to-1.0 division a few lines up in
+        # check() can turn a weight that was exactly `cap` into something
+        # like cap + 4e-17 through ordinary float rounding. Without this
+        # slack that harmless dust would trip a veto that shouldn't fire.
+        tol = 1e-9
+
+        for _ in range(20):
+            over_mask = w > cap + tol
+            if not over_mask.any():
+                break
+
+            # Log one decision per ticker the moment it's found over cap.
+            # A ticker set to exactly `cap` can never re-enter over_mask in a
+            # later round (redistribution only adds to tickers still under
+            # cap), so this can't double-log the same ticker.
+            for ticker in w.index[over_mask]:
+                decisions.append(self._log({
+                    "action": "position_veto",
+                    "ticker": ticker,
+                    "original": float(w[ticker]),
+                    "clipped_to": cap,
+                }))
+
+            excess = float((w[over_mask] - cap).sum())
+            w[over_mask] = cap
+
+            under_mask = w < cap
+            under_total = float(w[under_mask].sum())
+            if under_total > 0:
+                # Spread the excess proportionally to current weight among
+                # tickers still under the cap.
+                w[under_mask] += excess * (w[under_mask] / under_total)
+            else:
+                # Every ticker is already at the cap — nowhere to put the
+                # excess. It's simply not allocated (effectively cash).
+                break
+
+        # Final hard safety clip: guards against float drift or hitting the
+        # iteration limit while something is still (barely) over the cap.
+        w[w > cap] = cap
+        return w
 
     def _log(self, payload: dict) -> dict:
         """Stamp payload with a UTC timestamp, write it to the log file,

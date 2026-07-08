@@ -6,17 +6,23 @@ import config
 
 
 def test_revision_momentum_positive(tmp_path, monkeypatch):
-    """When estimates are consistently revised upward, revision_momentum should be positive (before z-scoring)."""
+    """When estimates are revised upward across a realistic quarterly gap,
+    revision_momentum should be positive (before z-scoring).
+
+    Real quarterly earnings reports land ~91-92 calendar days apart (a year
+    divided by 4). REVISION_WINDOW is 120 days specifically so that two
+    consecutive quarterly reports both land inside the window — with the
+    old 90-day window, a 91-day gap would fall just *outside* it and
+    revision_momentum would be NaN for nearly every real ticker.
+    """
     from src.features import revision_features
 
     today = datetime(2024, 6, 1)
     df = pd.DataFrame([
-        {"ticker": "AAPL", "date": (today - timedelta(days=80)).strftime("%Y-%m-%d"),
+        {"ticker": "AAPL", "date": (today - timedelta(days=91)).strftime("%Y-%m-%d"),
          "estimated_eps": 1.00, "actual_eps": 1.05, "surprise_pct": 5.0},
-        {"ticker": "AAPL", "date": (today - timedelta(days=50)).strftime("%Y-%m-%d"),
-         "estimated_eps": 1.10, "actual_eps": 1.15, "surprise_pct": 4.5},
-        {"ticker": "AAPL", "date": (today - timedelta(days=20)).strftime("%Y-%m-%d"),
-         "estimated_eps": 1.25, "actual_eps": 1.28, "surprise_pct": 2.4},
+        {"ticker": "AAPL", "date": today.strftime("%Y-%m-%d"),
+         "estimated_eps": 1.20, "actual_eps": 1.25, "surprise_pct": 4.2},
     ])
     monkeypatch.setattr(config, "EARNINGS_FILE", tmp_path / "earnings.parquet")
     df.to_parquet(tmp_path / "earnings.parquet", index=False)
@@ -26,26 +32,30 @@ def test_revision_momentum_positive(tmp_path, monkeypatch):
 
     # With AAPL having upward revisions and MSFT having no data, AAPL gets a raw positive value.
     # With only 1 ticker having data (AAPL), z-scoring is not possible — raw value stored.
-    # Test that the result is not empty and has the right structure.
     assert not result.empty
     assert ("revision_momentum", "AAPL") in result.columns
+    val = result.loc[today, ("revision_momentum", "AAPL")]
+    assert not np.isnan(val), "91-day-apart quarterly reports must both fall inside the 120-day window"
+    assert val > 0  # estimate rose from 1.00 to 1.20
 
 
 def test_revision_momentum_cross_sectional(tmp_path, monkeypatch):
-    """With two tickers, one with rising estimates and one with falling, they should have opposite signs."""
+    """With two tickers, one with rising estimates and one with falling
+    (each pair spaced a realistic ~91-92 days apart, one quarterly cycle),
+    they should have opposite signs after z-scoring."""
     from src.features import revision_features
 
     today = datetime(2024, 6, 1)
-    # AAPL: estimates rising
-    # MSFT: estimates falling
+    # AAPL: estimates rising over one quarterly cycle (~91 days)
+    # MSFT: estimates falling over one quarterly cycle (~92 days)
     df = pd.DataFrame([
-        {"ticker": "AAPL", "date": (today - timedelta(days=80)).strftime("%Y-%m-%d"),
+        {"ticker": "AAPL", "date": (today - timedelta(days=91)).strftime("%Y-%m-%d"),
          "estimated_eps": 1.00, "actual_eps": 1.05, "surprise_pct": 5.0},
-        {"ticker": "AAPL", "date": (today - timedelta(days=40)).strftime("%Y-%m-%d"),
+        {"ticker": "AAPL", "date": today.strftime("%Y-%m-%d"),
          "estimated_eps": 1.20, "actual_eps": 1.25, "surprise_pct": 4.2},
-        {"ticker": "MSFT", "date": (today - timedelta(days=75)).strftime("%Y-%m-%d"),
+        {"ticker": "MSFT", "date": (today - timedelta(days=92)).strftime("%Y-%m-%d"),
          "estimated_eps": 2.50, "actual_eps": 2.45, "surprise_pct": -2.0},
-        {"ticker": "MSFT", "date": (today - timedelta(days=35)).strftime("%Y-%m-%d"),
+        {"ticker": "MSFT", "date": today.strftime("%Y-%m-%d"),
          "estimated_eps": 2.20, "actual_eps": 2.18, "surprise_pct": -0.9},
     ])
     monkeypatch.setattr(config, "EARNINGS_FILE", tmp_path / "earnings.parquet")

@@ -204,12 +204,18 @@ def generate_attribution_report(
         equity_curve_path = config.DATA_DIR / "equity_curve.parquet"
         if equity_curve_path.exists():
             eq = pd.read_parquet(equity_curve_path)
-            # Filter to the target month
-            month_rows = eq[eq.index.astype(str).str.startswith(month)]
+            # BUG (fixed): the old filter used `eq.index.astype(str).str.startswith(month)`,
+            # but the equity curve has a plain RangeIndex (0, 1, 2, ...), not a date
+            # index — so that filter matched nothing (or garbage) and
+            # _equity_change_pct was silently always 0.0. The real date lives in
+            # the "date" column, so filter on that instead.
+            eq["date"] = pd.to_datetime(eq["date"])
+            month_rows = eq[eq["date"].dt.strftime("%Y-%m") == month].sort_values("date")
             if len(month_rows) >= 2:
-                _equity_change_pct = float(
-                    (month_rows.iloc[-1] - month_rows.iloc[0]) / month_rows.iloc[0]
-                )
+                first_equity = float(month_rows["equity"].iloc[0])
+                last_equity  = float(month_rows["equity"].iloc[-1])
+                if first_equity != 0:
+                    _equity_change_pct = (last_equity - first_equity) / first_equity
     except Exception:
         _equity_change_pct = 0.0  # graceful fallback — never block reporting
 

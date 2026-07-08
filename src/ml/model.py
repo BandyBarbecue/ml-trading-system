@@ -27,9 +27,16 @@ FEATURE_COLS = [
 ]
 
 
+#  Below this feature-weight, a feature is treated as "not predictive right now"
+#  and is dropped from training entirely (see the feature_weights handling in
+#  train() for why this replaced the old sample_weight approach).
+FEATURE_WEIGHT_FLOOR = 0.05
+
+
 def train(
     feature_matrix: pd.DataFrame,
     feature_weights: dict[str, float] | None = None,
+    params: dict | None = None,
     save: bool = True,
 ) -> lgb.LGBMRegressor:
     """Train LightGBM on the feature matrix to predict cross-sectional return rank.
@@ -40,9 +47,16 @@ def train(
         Must contain columns for every entry in FEATURE_COLS plus a 'target' column
         (float in [0, 1] — the stock's cross-sectional rank on that day).
     feature_weights : dict[str, float] | None
-        Optional per-feature importance weights from the IC tracker. Features with
-        higher recent information coefficient (IC) are given more influence by
-        passing them as LightGBM feature weights. If None, all features are equal.
+        Optional per-feature IC-derived weights from the IC tracker (see
+        src/ml/ic_tracker.py::get_feature_weights). Used for FEATURE SELECTION:
+        any available feature whose weight is below FEATURE_WEIGHT_FLOOR is
+        dropped from training. Features absent from the dict are treated as
+        "unknown" and kept. If None, all available features are used.
+    params : dict | None
+        Optional LightGBM hyperparameter overrides (e.g. from
+        src/ml/tuner.py::load_latest_params()). Any key here overrides the
+        corresponding default below; keys not present keep their default.
+        If None, the defaults are used unchanged.
     save : bool
         If True, pickle the fitted model to config.MODELS_DIR / 'lgbm_YYYY-MM.pkl'.
         Set to False during walk-forward to avoid cluttering disk with interim models.
@@ -59,6 +73,26 @@ def train(
         c for c in FEATURE_COLS
         if c in feature_matrix.columns and feature_matrix[c].notna().any()
     ]
+
+    # feature_weights → feature SELECTION, not per-sample weighting.
+    #
+    # WHY: LightGBM's sklearn API (LGBMRegressor.fit) has no argument for
+    # per-FEATURE weights — only `sample_weight`, which weights entire ROWS.
+    # An earlier version of this function tried to fake per-feature weighting
+    # by setting every row's sample_weight to the SAME constant
+    # (np.full(len(X), weights_array.mean())). Scaling every sample by an
+    # identical constant is a no-op — LightGBM's splits and leaf values are
+    # invariant to a uniform rescale of all weights, so it silently did
+    # nothing. Instead, we use feature_weights honestly: features the IC
+    # tracker has flagged as barely predictive (weight below
+    # FEATURE_WEIGHT_FLOOR) are dropped from the training set entirely, so
+    # the model can't waste tree splits on noise.
+    if feature_weights is not None:
+        avail_features = [
+            c for c in avail_features
+            if feature_weights.get(c, 1.0) >= FEATURE_WEIGHT_FLOOR
+        ]
+
     # Only drop rows where the TARGET is unknown — we can't train without knowing
     # the outcome. Missing FEATURE values are filled with 0 (neutral signal) rather
     # than dropping the row: news_score is legitimately 0 for dates with no news,
@@ -69,25 +103,11 @@ def train(
     y = train_data["target"]
     if X.empty:
         raise ValueError(
-            "No training rows remain after dropping rows without a target — "
-            f"available features: {avail_features}"
+            "No training rows remain after dropping rows without a target (or "
+            f"after feature_weights filtering) — available features: {avail_features}"
         )
 
-    # sample_weight: if the caller provided per-feature IC weights, translate them
-    # into per-sample weights based on how "informative" each row's features are.
-    # The simplest proxy: weight each sample by the average IC of its non-null features.
-    sample_weight = None
-    if feature_weights is not None:
-        weights_array = np.array([
-            feature_weights.get(col, 1.0) for col in avail_features
-        ])
-        # Clip to avoid zero or negative weights from bad IC values
-        weights_array = np.clip(weights_array, 1e-3, None)
-        # Broadcast: every sample gets the same feature-average weight vector
-        # (we're weighting features, not individual rows, so all rows share this)
-        sample_weight = np.full(len(X), weights_array.mean())
-
-    params = {
+    default_params = {
         "objective": "regression",
         "metric": "rmse",
         "n_estimators": 300,
@@ -100,9 +120,14 @@ def train(
         "verbose": -1,           # silence LightGBM's training log spam
         "n_jobs": -1,            # use all available CPU cores
     }
+    # Caller-supplied params (e.g. from Optuna tuning) override the defaults
+    # above key-by-key. Dict unpacking order matters here: default_params is
+    # spread first, then params, so params' values win on any key collision —
+    # any key params does NOT mention (like verbose/n_jobs) keeps its default.
+    merged_params = {**default_params, **params} if params else default_params
 
-    model = lgb.LGBMRegressor(**params)
-    model.fit(X, y, sample_weight=sample_weight)
+    model = lgb.LGBMRegressor(**merged_params)
+    model.fit(X, y)
 
     if save:
         # Access through config module so tests can monkeypatch config.MODELS_DIR
@@ -205,7 +230,17 @@ def walk_forward_backtest(
     # Start after we have enough history for the first training window
     i = train_days
     while i + test_days <= len(dates):
-        train_dates = dates[i - train_days : i]   # window BEFORE the test period
+        # PURGE / EMBARGO: each row's target is a TARGET_HORIZON-day FORWARD
+        # return rank (see feature_matrix.py). A training row dated d actually
+        # "knows" prices up to d + TARGET_HORIZON. If we trained on the last
+        # TARGET_HORIZON dates right before the test window, those rows' targets
+        # would overlap with (partly be computed from) prices inside the test
+        # window — the model would be trained on information from the future
+        # it's about to be tested on. We embargo the last TARGET_HORIZON dates
+        # of the training window so every training target's horizon ends
+        # strictly before the test window begins. Explicit train/test boundary,
+        # per project rule #2 (no data leakage, ever).
+        train_dates = dates[i - train_days : i - config.TARGET_HORIZON]
         test_dates  = dates[i : i + test_days]    # window we're predicting
 
         train_data = feature_matrix[feature_matrix["date"].isin(train_dates)]

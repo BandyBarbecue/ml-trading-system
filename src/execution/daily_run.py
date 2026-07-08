@@ -27,10 +27,14 @@ Design decisions:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 import traceback
 from datetime import datetime
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -41,14 +45,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The box running this scheduler lives in Europe/London, but every trading
+# decision (is it Monday? is it the 1st of the month? what's "today"?) must
+# be judged against the US market calendar. Mirrors intraday_runner._now_et().
+_ET = ZoneInfo("America/New_York")
+
 
 # ---------------------------------------------------------------------------
 # Date helper — extracted so tests can patch it with monkeypatch
 # ---------------------------------------------------------------------------
 
 def _today() -> datetime:
-    """Return the current datetime.  Extracted so tests can override it."""
-    return datetime.now()
+    """Return the current datetime in US/Eastern time.  Extracted so tests
+    can override it.
+
+    Why ET and not London-local: a naive datetime.now() reads the box's local
+    clock (London). Around midnight ET / BST transitions this can put
+    is_monday / is_first_month / the log-date string a day off from what US
+    markets actually observe — e.g. 00:30 London time on a Tuesday is still
+    Monday evening in New York.
+    """
+    return datetime.now(tz=_ET)
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +144,35 @@ def _get_account_value() -> float:
         return 100_000.0
 
 
+def _save_target_weights(weights: pd.Series, date_str: str) -> None:
+    """Persist Step 5's final HRP-sized weights to data/target_weights.json.
+
+    Without this, intraday_runner.py had no way to know the daily model's
+    actual position sizing and fell back to naive equal-weight (1/N) for
+    every "full" entry — discarding all the HRP risk-parity work Step 5 does.
+
+    Atomic write (temp file in the same directory + os.replace) so a crash
+    mid-write can never leave intraday_runner reading a half-written /
+    corrupt JSON file — readers always see either the previous complete file
+    or the new complete file, never something in between.
+    """
+    path = config.DATA_DIR / "target_weights.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"date": date_str, "weights": {k: float(v) for k, v in weights.items()}}
+
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(payload))
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.remove(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
@@ -143,7 +189,7 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
 
     Returns:
         A dict with the following keys:
-          - "date":           today's date as "YYYY-MM-DD"
+          - "date":           today's date as "YYYY-MM-DD" (US/Eastern)
           - "step":           last successfully completed step (int, 1–7)
           - "scores":         pd.Series of ML scores, or None
           - "weights":        pd.Series of target weights, or None
@@ -151,6 +197,9 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
           - "orders":         list of submitted order dicts (empty if dry_run)
           - "risk_decisions": list of risk-engine decision dicts
           - "errors":         list of error strings from any step that failed
+          - "halted":         only present (True) if today was already
+                               halted by an earlier kill-switch trigger — in
+                               that case the pipeline did not run at all.
     """
     now = _today()
     today = now.strftime("%Y-%m-%d")
@@ -166,6 +215,53 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
         "errors":         [],
     }
 
+    # ------------------------------------------------------------------
+    # Restart-safe halt check.  If the kill switch fired earlier today
+    # (this run crashed after Step 6, or a human/Task-Scheduler retriggers
+    # the same day), risk_state.json will have today's ET date recorded.
+    # Checking this FIRST — before touching any data, models, or Alpaca —
+    # means a retried run can't quietly resume trading on a day that was
+    # supposed to be halted.
+    # ------------------------------------------------------------------
+    from src.execution.risk_state import is_halted
+    if is_halted(today):
+        msg = f"Trading halted for {today} (kill switch fired earlier today) — refusing to run."
+        logger.error(msg)
+        result["errors"].append(msg)
+        result["halted"] = True
+        return result
+
+    # ------------------------------------------------------------------
+    # Run lock — refuses to start if another run is already in progress
+    # (e.g. Task Scheduler firing an overlapping run, or a manual run
+    # colliding with the scheduled one). Prevents double-submitted orders.
+    # ------------------------------------------------------------------
+    from src.execution.paper_trader import acquire_run_lock, release_run_lock
+    if not acquire_run_lock():
+        msg = "Another run is already in progress (run.lock held) — exiting without trading."
+        logger.error(msg)
+        result["errors"].append(msg)
+        return result
+
+    try:
+        return _run_daily_locked(now, today, result, dry_run, force_rebalance)
+    finally:
+        release_run_lock()
+
+
+def _run_daily_locked(
+    now: datetime,
+    today: str,
+    result: dict,
+    dry_run: bool,
+    force_rebalance: bool,
+) -> dict:
+    """The actual 7-step pipeline body, run while holding the run lock.
+
+    Split out from run_daily() purely so the lock-acquire/release plumbing
+    at the top level stays easy to read — this function assumes the lock is
+    already held and the halt check already passed.
+    """
     is_monday       = (now.weekday() == config.REBALANCE_WEEKDAY) or force_rebalance
     is_first_month  = now.day == 1
 
@@ -253,8 +349,15 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
             recent = feature_matrix.dropna(subset=["target"])
             for col in FEATURE_COLS:
                 if col in recent.columns:
-                    ic = compute_ic(recent[col], recent["target"])
-                    tracker.update(col, ic)
+                    # dates=recent["date"] activates the 60-day rolling IC
+                    # window (see compute_ic's docstring) — without it, IC
+                    # was computed over the entire ~2-year buffer every day,
+                    # so "dynamic" IC weighting barely moved day to day.
+                    ic = compute_ic(recent[col], recent["target"], dates=recent["date"])
+                    # as_of=today makes repeated intra-month calls (this runs
+                    # once per trading DAY) collapse into one observation per
+                    # calendar MONTH, matching IC_RETIRE_MONTHS' units.
+                    tracker.update(col, ic, as_of=today)
             tracker.save()  # persist to data/features/ic_tracker.json
 
         # Compute regime weights (empty dict = no modulation if anything fails)
@@ -283,8 +386,8 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
     # Step 4: ML inference (or retrain on the 1st of the month)
     # ------------------------------------------------------------------
     try:
-        from src.ml.model  import predict, train, load_latest_model
-        from src.ml.tuner  import load_latest_params  # noqa: F401 — available for future use
+        from src.ml.model  import predict, train, load_latest_model, FEATURE_WEIGHT_FLOOR
+        from src.ml.tuner  import load_latest_params
 
         existing_model = load_latest_model()
 
@@ -297,9 +400,22 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
                 k: feature_weights.get(k, 1.0) * regime_feature_weights.get(k, 1.0)
                 for k in set(feature_weights) | set(regime_feature_weights)
             } if (feature_weights or regime_feature_weights) else {}
+
+            # Log which features model.train() will drop for being below the
+            # feature-selection floor, so a human reading the log can see why
+            # the model's feature set shrank without having to dig into
+            # model.py's internals.
+            dropped = [k for k, v in combined_weights.items() if v < FEATURE_WEIGHT_FLOOR]
+            if dropped:
+                logger.info(
+                    "Step 4: dropping %d feature(s) below weight floor (%.2f): %s",
+                    len(dropped), FEATURE_WEIGHT_FLOOR, dropped,
+                )
+
             model = train(
                 feature_matrix,
                 feature_weights=combined_weights if combined_weights else None,
+                params=load_latest_params(),
                 save=True,
             )
         else:
@@ -364,6 +480,16 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
                         (weights > 0).sum(), (weights < 0).sum(),
                     )
 
+            # Persist the final Step 5 weights so intraday_runner.py can size
+            # entries against real HRP targets instead of naive equal-weight.
+            # Never let this crash the pipeline — worst case intraday falls
+            # back to equal-weight (logged there), which is safe, just less
+            # optimal.
+            try:
+                _save_target_weights(weights, today)
+            except Exception as exc:
+                logger.warning("Could not persist target_weights.json: %s", exc)
+
             # Log a feature breakdown for every selected ticker so there is a
             # human-readable record of what drove each pick.
             try:
@@ -409,8 +535,22 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
 
             engine        = RiskEngine()
             account_value = _get_account_value()
-            from src.execution.risk_state   import get_peak_value
-            from src.execution.equity_tracker import update_equity
+            from src.execution.risk_state     import get_peak_value, set_halted
+            from src.execution.equity_tracker import update_equity, load_previous_equity
+
+            # Real daily P&L for the kill switch. Previously this was
+            # hardcoded to 0.0, which meant the kill switch (daily_pnl_pct
+            # <= -DAILY_LOSS_LIMIT) could NEVER fire — a flat 0.0% is never
+            # <= a negative threshold. Compute it from yesterday's persisted
+            # equity-curve row instead.
+            daily_pnl_pct = 0.0  # first run ever (no prior equity history) → can't compute a % change yet
+            try:
+                prev_equity = load_previous_equity(today)
+                if prev_equity is not None and prev_equity != 0:
+                    daily_pnl_pct = (account_value - prev_equity) / prev_equity
+            except Exception as exc:
+                logger.warning("Could not compute daily P&L (using 0.0): %s", exc)
+
             update_equity(account_value)
             peak_value = get_peak_value(account_value)
 
@@ -419,8 +559,14 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
                 account_value,
                 peak_value,
                 vix,
-                daily_pnl_pct=0.0,
+                daily_pnl_pct=daily_pnl_pct,
             )
+
+            # If the kill switch fired, persist the halt so a same-day
+            # restart (crash + Task Scheduler retry, or a manual rerun)
+            # can't quietly resume trading — see risk_state.set_halted.
+            if any(d.get("action") == "kill_switch" for d in decisions):
+                set_halted(today)
 
             from src.portfolio.construction import compute_trades as _compute_trades
 
@@ -429,7 +575,8 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
             result["trades"]         = _compute_trades(adjusted_weights, current_weights)
 
             logger.info(
-                "Step 6 complete: risk engine fired %d decision(s).", len(decisions)
+                "Step 6 complete: risk engine fired %d decision(s) (daily_pnl_pct=%.4f).",
+                len(decisions), daily_pnl_pct,
             )
         else:
             logger.info("Step 6 skipped: no weights to vet.")
@@ -494,7 +641,7 @@ if __name__ == "__main__":
     # so Task Scheduler runs leave a permanent record even with no visible terminal.
     log_dir = config.DATA_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"daily_run_{datetime.now().strftime('%Y-%m-%d')}.log"
+    log_file = log_dir / f"daily_run_{_today().strftime('%Y-%m-%d')}.log"
 
     logging.basicConfig(
         level=logging.INFO,

@@ -92,7 +92,11 @@ def compute_vol(
     """
     result = {}
     for ticker, df in prices.items():
-        daily_ret = df["close"].pct_change()
+        # fill_method=None: without it, pandas forward-fills gaps in the
+        # price series before computing % change, silently turning a missing
+        # day into a fabricated 0% return (and emits a FutureWarning in
+        # recent pandas). Matches feature_matrix.py's pct_change call.
+        daily_ret = df["close"].pct_change(fill_method=None)
         result[ticker] = daily_ret.rolling(window).std()
     return pd.DataFrame(result)
 

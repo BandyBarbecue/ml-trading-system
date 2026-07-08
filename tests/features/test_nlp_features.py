@@ -66,6 +66,68 @@ def test_supply_chain_score_propagated(tmp_path, monkeypatch):
     assert "TSMC" in scores["supply_chain_score"].columns
     assert scores["supply_chain_score"]["TSMC"].iloc[0] > 0
 
+def test_after_close_headline_shifts_to_next_day():
+    """A headline published after the 16:00 ET close must not affect the
+    same day's score — it belongs to the NEXT day's window instead.
+
+    17:15 ET on 2024-01-02 is 22:15 UTC (EST = UTC-5 in January).
+    """
+    from src.features import nlp_features
+
+    late_headline = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "headline": ["Apple announces after-hours buyback expansion"],
+        "published_at": pd.to_datetime(["2024-01-02 22:15:00"]).tz_localize("UTC"),
+        "source": ["Reuters"],
+    })
+    signals = [{
+        "headline": "Apple announces after-hours buyback expansion",
+        "event_type": "other",
+        "primary_ticker": "AAPL",
+        "direction": "bullish",
+        "magnitude": "medium",
+        "time_horizon": "1week",
+        "confidence": 0.9,
+        "affected_tickers": [],
+    }]
+
+    dates = pd.bdate_range("2024-01-02", "2024-01-03")
+    scores = nlp_features._aggregate_scores(signals, dates, late_headline)
+
+    same_day_score = scores["news_score"].loc["2024-01-02", "AAPL"]
+    next_day_score = scores["news_score"].loc["2024-01-03", "AAPL"]
+
+    assert same_day_score == 0.0, "A post-16:00-ET headline must not count for the publish day"
+    assert next_day_score > 0.0, "A post-16:00-ET headline must count (at 2x recency) for the next day"
+
+
+def test_null_affected_tickers_does_not_crash():
+    """affected_tickers can be present but explicitly null (not just missing) —
+    must not raise a TypeError when iterating over it."""
+    from src.features import nlp_features
+
+    headlines = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "headline": ["Apple reports strong quarter"],
+        "published_at": pd.to_datetime(["2024-01-02 14:00:00"]).tz_localize("UTC"),
+        "source": ["Reuters"],
+    })
+    signals = [{
+        "headline": "Apple reports strong quarter",
+        "event_type": "earnings_beat",
+        "primary_ticker": "AAPL",
+        "direction": "bullish",
+        "magnitude": "large",
+        "time_horizon": "1month",
+        "confidence": 0.9,
+        "affected_tickers": None,   # explicit null, not a missing key
+    }]
+
+    dates = pd.bdate_range("2024-01-02", "2024-01-02")
+    scores = nlp_features._aggregate_scores(signals, dates, headlines)  # must not raise
+    assert scores["news_score"].loc["2024-01-02", "AAPL"] > 0
+
+
 def test_cache_prevents_reprocessing(tmp_path, monkeypatch):
     from src.features import nlp_features
     cache_path = tmp_path / "cache.json"

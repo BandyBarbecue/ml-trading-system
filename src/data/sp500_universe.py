@@ -6,11 +6,34 @@ https://en.wikipedia.org/wiki/List_of_S%26P_500_companies — no API key needed.
 
 The CSV cache means we only hit Wikipedia once (or when you explicitly refresh),
 which is polite to Wikipedia and fast for repeated runs.
+
+SURVIVORSHIP BIAS WARNING
+--------------------------
+Wikipedia's table lists the *current* S&P 500 members. Every price/news/
+earnings/insider fetch that starts from get_symbols() uses this same list —
+including when pulling several years of *historical* data. That means a
+company that was in the index in, say, 2021 but has since been removed
+(acquired, bankrupt, delisted, demoted) never appears anywhere in our
+dataset, while every ticker we do have is, by definition, one that survived
+to today. Backtests built on this universe will look better than a real
+point-in-time strategy would have performed, because the failures have been
+quietly erased from the sample. This is a known, *unfixed* limitation — see
+get_symbols() for the runtime warning, and CLAUDE.md for the project-wide
+rule this violates.
 """
+
+import logging
 
 import requests
 import pandas as pd
 from config import UNIVERSE_FILE
+
+log = logging.getLogger(__name__)
+
+# Set to True after the first survivorship-bias warning has been logged, so
+# we nag once per process (e.g. once per backtest run) instead of spamming
+# the log every time get_symbols() is called in a loop.
+_survivorship_warned = False
 
 
 def fetch_sp500_tickers() -> pd.DataFrame:
@@ -61,7 +84,23 @@ def get_symbols(refresh: bool = False) -> list[str]:
     """Return list of S&P 500 ticker symbols (Alpaca-compatible).
 
     This is the main entry point for other modules that just need the ticker list.
+
+    Warning: this is the *current* constituent list applied across all of
+    history (see the module docstring's SURVIVORSHIP BIAS WARNING). We log
+    a one-time warning the first time this is called in a process so it's
+    impossible to run a backtest without seeing the caveat at least once.
     """
+    global _survivorship_warned
+    if not _survivorship_warned:
+        log.warning(
+            "sp500_universe.get_symbols() returns CURRENT S&P 500 members "
+            "applied to historical data — this is survivorship-biased. "
+            "Delisted/removed/acquired companies are missing from the "
+            "backtest sample, so results are upward-biased vs. a true "
+            "point-in-time strategy. Read backtest numbers with this in mind."
+        )
+        _survivorship_warned = True
+
     all_tickers = load_sp500_tickers(refresh)["ticker"].tolist()
     return [t for t in all_tickers if t not in _ALPACA_UNSUPPORTED]
 

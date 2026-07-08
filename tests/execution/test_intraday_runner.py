@@ -6,12 +6,15 @@ Alpaca API calls or file I/O ever happens during CI.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
+
+import config
 
 _ET = ZoneInfo("America/New_York")
 
@@ -128,6 +131,71 @@ def test_next_bar_time_before_half():
 
 
 # ---------------------------------------------------------------------------
+# _is_final_bar
+# ---------------------------------------------------------------------------
+
+def test_is_final_bar_true_when_next_boundary_past_close():
+    """15:30 → next boundary is 16:00, which is >= close (15:50) → final bar."""
+    from src.execution.intraday_runner import _is_final_bar
+
+    assert _is_final_bar(_et(15, 30)) is True
+
+
+def test_is_final_bar_false_mid_day():
+    """11:00 → next boundary is 11:30, well before close → not final."""
+    from src.execution.intraday_runner import _is_final_bar
+
+    assert _is_final_bar(_et(11, 0)) is False
+
+
+# ---------------------------------------------------------------------------
+# _load_target_weights  (#15b)
+# ---------------------------------------------------------------------------
+
+def test_load_target_weights_missing_file_falls_back(tmp_path, monkeypatch):
+    from src.execution import intraday_runner
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    assert intraday_runner._load_target_weights() == {}
+
+
+def test_load_target_weights_corrupt_file_falls_back(tmp_path, monkeypatch):
+    from src.execution import intraday_runner
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    (tmp_path / "target_weights.json").write_text("{not valid json")
+
+    assert intraday_runner._load_target_weights() == {}
+
+
+def test_load_target_weights_stale_file_falls_back(tmp_path, monkeypatch):
+    from src.execution import intraday_runner
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    old_date = "2024-01-01"
+    (tmp_path / "target_weights.json").write_text(
+        json.dumps({"date": old_date, "weights": {"AAPL": 0.08}})
+    )
+
+    now = datetime(2024, 2, 1, tzinfo=_ET)  # 31 days later — past the 7-day threshold
+    assert intraday_runner._load_target_weights(now=now) == {}
+
+
+def test_load_target_weights_fresh_file_used(tmp_path, monkeypatch):
+    from src.execution import intraday_runner
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    recent_date = "2024-01-01"
+    (tmp_path / "target_weights.json").write_text(
+        json.dumps({"date": recent_date, "weights": {"AAPL": 0.08, "MSFT": 0.03}})
+    )
+
+    now = datetime(2024, 1, 3, tzinfo=_ET)  # 2 days later — within the threshold
+    result = intraday_runner._load_target_weights(now=now)
+    assert result == {"AAPL": 0.08, "MSFT": 0.03}
+
+
+# ---------------------------------------------------------------------------
 # run_bar
 # ---------------------------------------------------------------------------
 
@@ -157,6 +225,7 @@ def test_run_bar_dry_run_returns_empty():
         patch("src.execution.intraday_runner._now_et", return_value=_fake_now),
         patch("src.data.fetch_intraday.fetch_intraday", return_value=_make_bars()),
         patch("src.data.fetch_intraday._make_client", return_value=MagicMock()),
+        patch("src.execution.intraday_runner._load_target_weights", return_value={}),
         patch("src.execution.paper_trader._make_trading_client", return_value=MagicMock()),
         patch("src.execution.paper_trader.get_current_positions",
               return_value=pd.Series({"AAPL": 0.5})),
@@ -201,6 +270,7 @@ def test_run_bar_calls_fetch_intraday():
             "src.execution.intraday_signal.get_event_signal",
             return_value=None,
         ),
+        patch("src.execution.intraday_runner._load_target_weights", return_value={}),
         patch(
             "src.execution.paper_trader._make_trading_client",
             return_value=mock_trade,
@@ -242,6 +312,135 @@ def test_run_bar_empty_tickers_returns_empty():
 
 
 # ---------------------------------------------------------------------------
+# "eod" signal behaviour  (#15a)
+# ---------------------------------------------------------------------------
+
+def test_run_bar_eod_holds_position_mid_day():
+    """'eod' on a non-final bar must NOT trade — holding the position avoids
+    a sell/rebuy whipsaw every 30 minutes (the bug being fixed)."""
+    mock_bars = _make_bars(5)
+    _fake_now = datetime(2024, 1, 15, 11, 0, 0, tzinfo=_ET)
+
+    with (
+        patch("src.execution.intraday_runner._now_et", return_value=_fake_now),
+        patch("src.data.fetch_intraday._make_client", return_value=MagicMock()),
+        patch("src.data.fetch_intraday.fetch_intraday", return_value=mock_bars),
+        patch("src.execution.intraday_signal.get_entry_signal", return_value="eod"),
+        patch("src.execution.intraday_signal.get_event_signal", return_value=None),
+        patch("src.execution.intraday_runner._load_target_weights", return_value={}),
+        patch("src.execution.paper_trader._make_trading_client", return_value=MagicMock()),
+        patch("src.execution.paper_trader.get_current_positions",
+              return_value=pd.Series({"AAPL": 0.5})),
+        patch("src.execution.paper_trader.get_account_value", return_value=100_000.0),
+        patch("src.execution.paper_trader.submit_rebalance") as mock_submit,
+    ):
+        from src.execution.intraday_runner import run_bar
+
+        result = run_bar(
+            bar_idx=2, held_tickers=["AAPL"], news_signals=[],
+            dry_run=False, is_final_bar=False,
+        )
+
+    assert result == []
+    mock_submit.assert_not_called()
+
+
+def test_run_bar_eod_liquidates_on_final_bar():
+    """'eod' on the FINAL bar of the day DOES liquidate (target weight 0)."""
+    mock_bars = _make_bars(5)
+    _fake_now = datetime(2024, 1, 15, 15, 30, 0, tzinfo=_ET)
+
+    with (
+        patch("src.execution.intraday_runner._now_et", return_value=_fake_now),
+        patch("src.data.fetch_intraday._make_client", return_value=MagicMock()),
+        patch("src.data.fetch_intraday.fetch_intraday", return_value=mock_bars),
+        patch("src.execution.intraday_signal.get_entry_signal", return_value="eod"),
+        patch("src.execution.intraday_signal.get_event_signal", return_value=None),
+        patch("src.execution.intraday_runner._load_target_weights", return_value={}),
+        patch("src.execution.paper_trader._make_trading_client", return_value=MagicMock()),
+        patch("src.execution.paper_trader.get_current_positions",
+              return_value=pd.Series({"AAPL": 0.5})),
+        patch("src.execution.paper_trader.get_account_value", return_value=100_000.0),
+        patch("src.execution.paper_trader.submit_rebalance", return_value=[
+            {"ticker": "AAPL", "side": "sell", "shares": 1, "status": "accepted"}
+        ]) as mock_submit,
+    ):
+        from src.execution.intraday_runner import run_bar
+
+        run_bar(
+            bar_idx=5, held_tickers=["AAPL"], news_signals=[],
+            dry_run=False, is_final_bar=True,
+        )
+
+    mock_submit.assert_called_once()
+    delta_series = mock_submit.call_args[0][1]
+    assert delta_series["AAPL"] == pytest.approx(-0.5)  # 0.5 held → 0.0 target
+
+
+# ---------------------------------------------------------------------------
+# HRP target-weight sizing  (#15b)
+# ---------------------------------------------------------------------------
+
+def test_run_bar_uses_hrp_target_weights():
+    """'full' signal must scale toward the HRP target weight from
+    target_weights.json, not naive equal-weight (1/N)."""
+    mock_bars = _make_bars(3)
+    _fake_now = datetime(2024, 1, 15, 9, 30, 0, tzinfo=_ET)
+
+    with (
+        patch("src.execution.intraday_runner._now_et", return_value=_fake_now),
+        patch("src.data.fetch_intraday._make_client", return_value=MagicMock()),
+        patch("src.data.fetch_intraday.fetch_intraday", return_value=mock_bars),
+        patch("src.execution.intraday_signal.get_entry_signal", return_value="full"),
+        patch("src.execution.intraday_signal.get_event_signal", return_value=None),
+        patch("src.execution.intraday_runner._load_target_weights",
+              return_value={"AAPL": 0.08, "MSFT": 0.03}),
+        patch("src.execution.paper_trader._make_trading_client", return_value=MagicMock()),
+        patch("src.execution.paper_trader.get_current_positions",
+              return_value=pd.Series(dtype=float)),
+        patch("src.execution.paper_trader.get_account_value", return_value=100_000.0),
+        patch("src.execution.paper_trader.submit_rebalance", return_value=[]) as mock_submit,
+    ):
+        from src.execution.intraday_runner import run_bar
+
+        run_bar(bar_idx=0, held_tickers=["AAPL", "MSFT"], news_signals=[], dry_run=False)
+
+    delta_series = mock_submit.call_args[0][1]
+    # Naive equal-weight would have given each ticker 0.5 (1/2 held tickers).
+    # Instead each delta must match its own HRP weight.
+    assert delta_series["AAPL"] == pytest.approx(0.08)
+    assert delta_series["MSFT"] == pytest.approx(0.03)
+
+
+def test_run_bar_falls_back_to_equal_weight_when_ticker_missing_from_hrp():
+    """A ticker not present in target_weights.json falls back to equal-weight
+    (1/N) rather than crashing or silently dropping the ticker."""
+    mock_bars = _make_bars(3)
+    _fake_now = datetime(2024, 1, 15, 9, 30, 0, tzinfo=_ET)
+
+    with (
+        patch("src.execution.intraday_runner._now_et", return_value=_fake_now),
+        patch("src.data.fetch_intraday._make_client", return_value=MagicMock()),
+        patch("src.data.fetch_intraday.fetch_intraday", return_value=mock_bars),
+        patch("src.execution.intraday_signal.get_entry_signal", return_value="full"),
+        patch("src.execution.intraday_signal.get_event_signal", return_value=None),
+        patch("src.execution.intraday_runner._load_target_weights", return_value={}),
+        patch("src.execution.paper_trader._make_trading_client", return_value=MagicMock()),
+        patch("src.execution.paper_trader.get_current_positions",
+              return_value=pd.Series(dtype=float)),
+        patch("src.execution.paper_trader.get_account_value", return_value=100_000.0),
+        patch("src.execution.paper_trader.submit_rebalance", return_value=[]) as mock_submit,
+    ):
+        from src.execution.intraday_runner import run_bar
+
+        run_bar(bar_idx=0, held_tickers=["AAPL", "MSFT"], news_signals=[], dry_run=False)
+
+    delta_series = mock_submit.call_args[0][1]
+    assert delta_series["AAPL"] == pytest.approx(0.5)
+    assert delta_series["MSFT"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
 # run_intraday — loop stop behaviour
 # ---------------------------------------------------------------------------
 
@@ -264,7 +463,7 @@ def test_run_intraday_stops_at_close(monkeypatch):
     # Track how many times run_bar is called.
     run_bar_calls: list[int] = []
 
-    def fake_run_bar(bar_idx, held_tickers, news_signals, dry_run=False):
+    def fake_run_bar(bar_idx, held_tickers, news_signals, dry_run=False, is_final_bar=False):
         run_bar_calls.append(bar_idx)
         return []
 
@@ -292,6 +491,11 @@ def test_run_intraday_stops_at_close(monkeypatch):
             "src.execution.intraday_runner._next_bar_time",
             return_value=datetime(2024, 1, 15, 10, 30, 0, tzinfo=_ET),
         ),
+        # New restart-safety guards (#14/#18c) — keep this test isolated
+        # from real risk_state.json / run.lock on disk.
+        patch("src.execution.risk_state.is_halted", return_value=False),
+        patch("src.execution.paper_trader.acquire_run_lock", return_value=True),
+        patch("src.execution.paper_trader.release_run_lock"),
     ):
         runner_mod.run_intraday(dry_run=True, date="2024-01-15")
 
@@ -299,3 +503,54 @@ def test_run_intraday_stops_at_close(monkeypatch):
         f"Expected run_bar called 2 times, got {len(run_bar_calls)}"
     )
     assert run_bar_calls == [0, 1], f"Expected bar indices [0, 1], got {run_bar_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Restart-safety guards on run_intraday  (#14 / #18c)
+# ---------------------------------------------------------------------------
+
+def test_run_intraday_halted_skips_loop_entirely(monkeypatch):
+    """If today is already halted (kill switch fired earlier), run_intraday
+    must not process any bars at all."""
+    import src.execution.intraday_runner as runner_mod
+
+    called = {"n": 0}
+
+    def fake_run_bar(*a, **kw):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(runner_mod, "run_bar", fake_run_bar)
+    # If the halt check didn't short-circuit, this would loop forever.
+    monkeypatch.setattr(runner_mod, "_is_market_hours", lambda now: True)
+
+    with (
+        patch("src.execution.risk_state.is_halted", return_value=True),
+        patch("src.execution.paper_trader.acquire_run_lock") as mock_acquire,
+    ):
+        runner_mod.run_intraday(dry_run=True, date="2024-01-15")
+        mock_acquire.assert_not_called()
+
+    assert called["n"] == 0
+
+
+def test_run_intraday_refuses_to_start_while_lock_held(monkeypatch):
+    """If run.lock is already held, run_intraday must not process any bars."""
+    import src.execution.intraday_runner as runner_mod
+
+    called = {"n": 0}
+
+    def fake_run_bar(*a, **kw):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(runner_mod, "run_bar", fake_run_bar)
+    monkeypatch.setattr(runner_mod, "_is_market_hours", lambda now: True)
+
+    with (
+        patch("src.execution.risk_state.is_halted", return_value=False),
+        patch("src.execution.paper_trader.acquire_run_lock", return_value=False),
+    ):
+        runner_mod.run_intraday(dry_run=True, date="2024-01-15")
+
+    assert called["n"] == 0

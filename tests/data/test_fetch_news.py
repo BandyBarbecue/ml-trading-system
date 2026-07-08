@@ -51,6 +51,34 @@ def test_update_news_skips_empty(tmp_path, monkeypatch):
     assert not (tmp_path / "2024-01-02.parquet").exists()
 
 
+def test_update_news_buckets_by_eastern_calendar_day(tmp_path, monkeypatch):
+    """An article at 2024-01-03 01:00 UTC is 2024-01-02 20:00 ET — it must
+    land in the Jan-2 file, not Jan-3, or it gets attributed to the wrong
+    trading day downstream."""
+    from src.data import fetch_news
+    monkeypatch.setattr(fetch_news, "NEWS_DIR", tmp_path)
+
+    mock_news = [
+        MagicMock(
+            symbols=["AAPL"],
+            headline="Late-night wire story",
+            created_at=pd.Timestamp("2024-01-03 01:00:00", tz="UTC"),
+            source="Reuters",
+        ),
+    ]
+    mock_resp = MagicMock()
+    mock_resp.__iter__ = MagicMock(return_value=iter(mock_news))
+
+    with patch.object(fetch_news, "_make_client") as mock_client_fn:
+        mock_client_fn.return_value.get_news.return_value = mock_resp
+        # target_date is inclusive of the window, so use a date on/after Jan 3
+        # to make sure the item is fetched, then verify it lands in Jan 2's file.
+        fetch_news.update_news(symbols=["AAPL"], target_date="2024-01-03")
+
+    assert (tmp_path / "2024-01-02.parquet").exists()
+    assert not (tmp_path / "2024-01-03.parquet").exists()
+
+
 def test_update_news_multi_ticker_item(tmp_path, monkeypatch):
     """A single news item that mentions two tickers should appear as two rows."""
     from src.data import fetch_news

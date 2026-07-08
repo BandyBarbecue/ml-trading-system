@@ -54,7 +54,10 @@ def fetch_and_save() -> None:
     )
 
     print(f"Requesting daily bars for {config.SYMBOLS}")
-    print(f"From {config.START_DATE.date()} to {config.END_DATE.date()}\n")
+    # START_DATE / END_DATE are plain "YYYY-MM-DD" strings in config.py, not
+    # datetime objects, so they print as-is -- no .date() call needed (that
+    # was the bug: strings don't have a .date() method).
+    print(f"From {config.START_DATE} to {config.END_DATE}\n")
 
     bars = client.get_stock_bars(request)
 

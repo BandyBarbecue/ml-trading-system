@@ -34,6 +34,7 @@ VIX_FILE      = DATA_DIR / "vix.parquet"
 # --- Universe ---
 # Populated from UNIVERSE_FILE at runtime; this is the fallback for quick tests
 FALLBACK_SYMBOLS = ["AAPL", "MSFT", "JNJ", "KO", "SPY"]
+SYMBOLS = FALLBACK_SYMBOLS  # legacy alias — small fixed universe used by the pre-ML modules
 
 # --- Date range (5-year lookback) ---
 END_DATE   = datetime.now().strftime("%Y-%m-%d")
@@ -58,6 +59,8 @@ HRP_LOOKBACK      = 60     # days of returns for HRP covariance
 # --- Risk ---
 DAILY_LOSS_LIMIT      = 0.02   # 2% intraday drop → exit all
 MAX_DRAWDOWN          = 0.15   # 15% from peak → scale to 50%
+DRAWDOWN_SCALE_FACTOR = 0.50   # multiplier applied on drawdown breach (kept separate from
+                                # VIX_SCALE_FACTOR so the two controls can be tuned independently)
 VIX_REGIME_THRESHOLD  = 30     # VIX > 30 → halve positions
 VIX_SCALE_FACTOR      = 0.50
 

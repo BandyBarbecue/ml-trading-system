@@ -37,6 +37,17 @@ def compute_insider_features(
     df = pd.read_parquet(insider_path)
     df["date"] = pd.to_datetime(df["date"])
 
+    # Rows are dated by the insider's TRANSACTION date, but that trade isn't
+    # public until the Form 4 filing hits the SEC — which the law allows up
+    # to ~2 business days later. If we filtered on the raw transaction date,
+    # a feature computed "as of" day T could reflect a trade the market
+    # didn't know about until T+1 or T+2 (look-ahead bias). Shifting by
+    # +2 business days mirrors the LAG_DAYS pattern in
+    # fundamental_features.py (there: 45 calendar days for SEC filings;
+    # here: 2 business days for Form 4s) so the window filter below only
+    # ever sees transactions that were actually public by date `date`.
+    df["effective_date"] = df["date"] + pd.offsets.BDay(2)
+
     records: dict[tuple, list] = {("insider_score", t): [] for t in symbols}
     index_dates = []
 
@@ -48,13 +59,13 @@ def compute_insider_features(
         for ticker in symbols:
             sub = df[
                 (df["ticker"] == ticker)
-                & (df["date"] >= cutoff)
-                & (df["date"] <= date)
+                & (df["effective_date"] >= cutoff)
+                & (df["effective_date"] <= date)
             ].copy()
             if sub.empty:
                 continue
 
-            sub["days_ago"] = (date - sub["date"]).dt.days
+            sub["days_ago"] = (date - sub["effective_date"]).dt.days
             sub["weight"] = 1.0 - sub["days_ago"] / INSIDER_WINDOW
 
             buys  = sub[sub["transaction_type"] == "P"]

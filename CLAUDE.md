@@ -50,6 +50,11 @@ The system is self-improving in three safe ways:
 5. **Secrets stay in `.env`.** Never hardcode API keys. `.env` is gitignored.
 6. **Each module has one job.** Data layer → features → ML → portfolio → risk → execution.
    Modules talk through DataFrames. None knows the internals of another.
+7. **Known survivorship bias in the universe.** `sp500_universe.py` uses the *current*
+   S&P 500 constituent list for all historical fetches — delisted/acquired/removed
+   companies never enter the dataset. Backtest numbers are upward-biased until
+   point-in-time constituent history is built; read them with that caveat, don't
+   quote them as if they were leak-free.
 
 ## Architecture
 

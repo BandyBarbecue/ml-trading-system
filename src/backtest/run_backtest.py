@@ -94,6 +94,36 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Close-price panel for P&L simulation
+# ---------------------------------------------------------------------------
+
+def _load_close_price_panel(tickers: list[str]) -> pd.DataFrame:
+    """Load a (date x ticker) close-price panel for the given tickers.
+
+    This reuses src/features/price_features.load_all_prices() — the SAME
+    price-loading function src/features/feature_matrix.py calls to build the
+    momentum/reversal/volatility features. We load it independently here
+    because build_feature_matrix() does not carry raw close prices through
+    into its output (only derived features + the forward-looking `target`
+    rank survive), and the `target` column is exactly what we must NOT use
+    for daily P&L (see run_backtest()'s docstring for why).
+
+    Returns
+    -------
+    pd.DataFrame
+        Index = date, columns = ticker, values = close price. Empty
+        DataFrame if none of the tickers have a parquet file on disk yet.
+    """
+    from src.features.price_features import load_all_prices
+
+    prices = load_all_prices(tickers)
+    if not prices:
+        return pd.DataFrame()
+    close_wide = pd.DataFrame({t: df["close"] for t, df in prices.items()})
+    return close_wide.sort_index()
+
+
+# ---------------------------------------------------------------------------
 # Metrics helpers
 # ---------------------------------------------------------------------------
 
@@ -156,6 +186,7 @@ def run_backtest(
     initial_value: float = 100_000.0,
     log_path: Path | None = None,
     apply_costs: bool = True,
+    close_prices: pd.DataFrame | None = None,
 ) -> dict:
     """Run a walk-forward backtest of the ML pipeline on historical data.
 
@@ -175,12 +206,30 @@ def run_backtest(
     before the corresponding test slice begins.  If you accidentally pass
     overlapping data the assertion will catch it immediately.
 
-    P&L simulation
-    ---------------
-    Daily P&L is approximated using the ``target`` column as a proxy return.
-    (``target`` is a cross-sectional rank in [0, 1]; we re-centre it to
-    [-0.5, +0.5] so that holding the median stock earns ~0 on any given day.)
-    For production use, replace this with real 1-day price returns.
+    P&L simulation — real returns, lagged by one day
+    --------------------------------------------------
+    Daily P&L is computed from REAL close-to-close simple returns, not from
+    the `target` column. `target` is a TARGET_HORIZON-day (20-day) FORWARD
+    cross-sectional return rank (see feature_matrix.py) — using it (even
+    re-centred to [-0.5, +0.5]) as "today's return" would let the equity
+    curve realise returns that are actually computed from prices up to 20
+    days in the future. That is a severe form of look-ahead bias: an older
+    version of this function did exactly that.
+
+    We also apply a one-day fill lag: weights decided using day T's close
+    (score, HRP, risk checks — all computed from information available AT
+    T's close) cannot start earning returns until T+1. In code:
+        portfolio_return(T+1) = sum(weights_as_of_T * simple_return(T+1))
+    Each day's loop iteration therefore applies TODAY's return using
+    yesterday's decided weights FIRST, and only THEN (if it's a rebalance
+    day) decides new weights that take effect starting tomorrow. Same-day
+    fills (deciding weights off T's close and having them earn T's own
+    return) are unrealistic — you cannot trade on a closing price before it
+    prints — and were the second leakage bug this function had.
+
+    The close prices used for these returns come from the SAME source
+    src/features/feature_matrix.py used to build the price-based features
+    (mom_1m, vol_20d, ...) — see close_prices below.
 
     Parameters
     ----------
@@ -197,6 +246,14 @@ def run_backtest(
     apply_costs : bool
         If True (default), deduct 7bps round-trip transaction costs on each
         rebalance.  Pass False (--no-costs flag) for a frictionless comparison.
+    close_prices : pd.DataFrame or None
+        Optional (date x ticker) close-price panel to use for daily P&L,
+        covering (at least) the tickers and dates in `feature_matrix`. If
+        None (default), it is loaded automatically from
+        data/prices/<TICKER>.parquet via
+        src.features.price_features.load_all_prices() — the same source
+        feature_matrix.py uses. Tests inject a synthetic panel here instead
+        of touching disk.
 
     Returns
     -------
@@ -236,13 +293,31 @@ def run_backtest(
         )
 
     # ------------------------------------------------------------------
+    # 0b. Load the REAL close-price panel used for daily P&L (see the
+    # "P&L simulation" section of this function's docstring for why this
+    # replaced using `target` as a return proxy).
+    # ------------------------------------------------------------------
+    tickers = fm["ticker"].unique().tolist()
+    if close_prices is None:
+        close_prices = _load_close_price_panel(tickers)
+    if close_prices is None or close_prices.empty:
+        raise ValueError(
+            "No close-price data available to simulate daily P&L. Either "
+            "pass `close_prices` explicitly (a date x ticker DataFrame), or "
+            "make sure data/prices/<TICKER>.parquet exists for the tickers "
+            "in feature_matrix."
+        )
+    # Simple (not log) daily returns: (close_t / close_{t-1}) - 1.
+    returns_panel = close_prices.sort_index().pct_change()
+
+    # ------------------------------------------------------------------
     # 1. Walk-forward loop
     # ------------------------------------------------------------------
     equity_curve: dict[pd.Timestamp, float] = {}
     portfolio_value = initial_value
     peak_value = initial_value
-    current_weights = pd.Series(dtype=float)  # empty on day 0
-    prev_weights = pd.Series(dtype=float)     # weights *before* each rebalance
+    held_weights = pd.Series(dtype=float)     # weights currently EARNING returns (decided as of yesterday's close)
+    prev_weights = pd.Series(dtype=float)     # weights *before* each rebalance (for turnover cost calc)
     n_rebalances = 0
 
     risk_log = log_path if log_path is not None else config.DATA_DIR / "decisions_backtest.jsonl"
@@ -279,14 +354,36 @@ def run_backtest(
             if day_slice.empty:
                 continue
 
-            # ---- Monday rebalance ----
-            # pd.Timestamp.weekday() returns 0 for Monday.
+            # ---- Daily P&L: apply TODAY's real return using YESTERDAY's weights ----
+            # This is the one-day fill lag (see docstring). `held_weights` were
+            # decided using a PRIOR day's close — never today's — so it's
+            # legitimate to let them earn today's close-to-close return. On the
+            # very first test day held_weights is still empty (no decision has
+            # been made yet), so no return is applied.
+            if not held_weights.empty and day in returns_panel.index:
+                day_returns = returns_panel.loc[day]
+                held = held_weights.index.intersection(day_returns.index)
+                if len(held) > 0:
+                    daily_pnl = float(
+                        (held_weights[held] * day_returns[held].fillna(0.0)).sum()
+                    )
+                    portfolio_value *= (1 + daily_pnl)
+
+            # ---- Monday rebalance: DECIDE new weights from today's close ----
+            # pd.Timestamp.weekday() returns 0 for Monday. These new weights
+            # are stored into held_weights at the end of this block but will
+            # not earn any return until tomorrow's iteration of this loop —
+            # today's return (above) already used the OLD held_weights.
             if day.weekday() == config.REBALANCE_WEEKDAY:
                 scores = predict(model, day_slice)
 
                 # Build a prices-proxy from recent target values so HRP has
                 # something to work with (shape: dates × tickers).
                 # We use the last HRP_LOOKBACK days from the training window.
+                # NOTE: this HRP covariance input still uses the target-rank
+                # proxy (not real returns) — that is a separate, pre-existing
+                # simplification and out of scope for this fix, which only
+                # covers the P&L simulation path below.
                 hrp_dates = train_dates[-config.HRP_LOOKBACK:]
                 prices_proxy = (
                     fm[fm["date"].isin(set(hrp_dates))]
@@ -302,22 +399,35 @@ def run_backtest(
                     proposed_weights = build_portfolio(
                         scores=scores,
                         sector_map=sector_map,
-                        current_weights=current_weights,
+                        current_weights=held_weights,
                         prices=prices_proxy,
                     )
-                except (ValueError, Exception):
-                    # If construction fails (e.g. too few tickers), keep current.
-                    proposed_weights = current_weights
+                except (ValueError, KeyError) as exc:
+                    # ValueError: e.g. build_portfolio's explicit "too few
+                    # tickers" check, or scipy's linkage()/squareform()
+                    # rejecting a degenerate (NaN/zero-variance) distance
+                    # matrix. KeyError: a ticker referenced by `scores` is
+                    # missing from prices_proxy/sector_map. Anything else
+                    # (e.g. a genuine bug) should still crash loudly instead
+                    # of being silently swallowed here.
+                    logger.warning(
+                        "build_portfolio failed on %s (%s: %s) — keeping "
+                        "existing weights.",
+                        day.date(), type(exc).__name__, exc,
+                    )
+                    proposed_weights = held_weights
 
                 # ---- Risk check ----
-                # Estimate today's daily P&L (0 on first day).
+                # Estimate today's daily P&L (0 on first day). portfolio_value
+                # already reflects today's return (applied above), so this
+                # correctly measures how far today's move has taken us from peak.
                 daily_pnl_pct = (portfolio_value - peak_value) / peak_value if equity_curve else 0.0
 
                 # Snapshot weights BEFORE the risk check so we can measure
                 # how much the portfolio actually changed after approval.
-                prev_weights = current_weights.copy()
+                prev_weights = held_weights.copy()
 
-                current_weights, _ = risk_engine.check(
+                new_weights, _ = risk_engine.check(
                     proposed_weights=proposed_weights,
                     current_value=portfolio_value,
                     peak_value=peak_value,
@@ -329,26 +439,17 @@ def run_backtest(
                 # ---- Transaction cost drag ----
                 # Deduct 7bps on the notional traded at this rebalance.
                 # This reduces portfolio value directly, simulating broker fees
-                # and bid-ask spread.
+                # and bid-ask spread. Costs are paid TODAY (the trade executes
+                # at today's close) even though the new weights only start
+                # earning returns tomorrow.
                 cost_drag = apply_transaction_costs(
-                    current_weights, prev_weights, apply_costs=apply_costs
+                    new_weights, prev_weights, apply_costs=apply_costs
                 )
                 portfolio_value *= (1 - cost_drag)
 
-            # ---- Daily P&L simulation ----
-            # Use target as a proxy for daily return.  The target is a rank in
-            # [0, 1]; subtracting 0.5 centres it so the average position earns ~0.
-            # This is a simplification — real P&L would use actual price changes.
-            if not current_weights.empty:
-                day_returns = (
-                    day_slice.set_index("ticker")["target"].subtract(0.5)
-                )
-                # Only look at tickers we actually hold.
-                held = current_weights.index.intersection(day_returns.index)
-                daily_pnl = float(
-                    (current_weights[held] * day_returns[held]).sum()
-                )
-                portfolio_value *= (1 + daily_pnl)
+                # held_weights now becomes "yesterday's weights" from the
+                # perspective of the NEXT loop iteration (tomorrow).
+                held_weights = new_weights
 
             equity_curve[day] = portfolio_value
 

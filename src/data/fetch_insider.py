@@ -135,10 +135,19 @@ def update_insider(
 ) -> None:
     """Fetch insider transactions for all S&P 500 tickers via yfinance.
 
-    Skips if already run today. Merges new data with the existing parquet
-    and de-duplicates on (ticker, date, insider_type, transaction_type, shares).
+    Skips if the full universe was already run today. Merges new data with
+    the existing parquet and de-duplicates on
+    (ticker, date, insider_type, transaction_type, shares).
     """
-    if _already_fetched_today():
+    # The "already fetched today" guard exists to avoid re-hitting yfinance
+    # for all 500 tickers twice in one day. It must only apply to a *full*
+    # universe run (symbols=None) — if we also checked/set it for a subset
+    # run (e.g. update_insider(symbols=["AAPL"]) for a manual spot-check),
+    # then a later full-universe run the same day would see the flag already
+    # set and skip entirely, silently leaving the other ~499 tickers stale.
+    is_full_universe_run = symbols is None
+
+    if is_full_universe_run and _already_fetched_today():
         log.info("insider: already fetched today — skipping.")
         return
 
@@ -156,7 +165,8 @@ def update_insider(
 
         time.sleep(0.1)  # polite pacing to avoid Yahoo Finance throttling
 
-    _mark_fetched_today()
+    if is_full_universe_run:
+        _mark_fetched_today()
 
     out_path: Path = config.INSIDER_FILE
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -226,6 +226,165 @@ def test_compute_trades():
 
 
 # ---------------------------------------------------------------------------
+# Invariant tests on adversarial inputs
+# ---------------------------------------------------------------------------
+# These target the "cap-then-renormalise" defect class: each control used to
+# be undone by a later renormalisation (e.g. a 60% tech sector "capped" at
+# 30% came out at 42.9%). The invariants below must hold on inputs built to
+# make each cap bind hard.
+
+def _turnover(a: pd.Series, b: pd.Series) -> float:
+    """Two-way turnover between two weight Series (union-aligned)."""
+    idx = a.index.union(b.index)
+    return float(
+        (a.reindex(idx, fill_value=0.0) - b.reindex(idx, fill_value=0.0)).abs().sum()
+    ) / 2.0
+
+
+def test_invariant_sector_cap_holds_under_concentration(monkeypatch):
+    """Adversarial: HRP hands 60% of the book to one 5-ticker sector.
+    After construction, EVERY sector must be <= MAX_SECTOR_PCT + 1e-9 —
+    the proven bug produced 42.9% for a '30% capped' sector."""
+    returns = make_returns()  # 25 tickers
+    scores = make_scores(returns)
+    tickers = returns.columns.tolist()
+    # 5 sectors x 5 tickers: feasible under a 30% cap (5 x 30% = 150% >= 100%)
+    sector_map = {t: f"Sector{i // 5}" for i, t in enumerate(tickers)}
+
+    import src.portfolio.construction as cons
+
+    def concentrated_hrp(ret: pd.DataFrame) -> pd.Series:
+        """60% into Sector0's five tickers, 40% spread across the rest."""
+        cols = ret.columns.tolist()
+        w = pd.Series(0.0, index=cols)
+        sector0 = [t for t in cols if sector_map[t] == "Sector0"]
+        others = [t for t in cols if t not in sector0]
+        w[sector0] = 0.60 / len(sector0)
+        w[others] = 0.40 / len(others)
+        return w
+
+    monkeypatch.setattr(cons, "hrp_weights", concentrated_hrp)
+
+    target = build_portfolio(
+        scores=scores,
+        sector_map=sector_map,
+        current_weights=pd.Series(dtype=float),
+        prices=returns,
+    )
+
+    for sector in set(sector_map.values()):
+        sector_total = target[[t for t in target.index if sector_map[t] == sector]].sum()
+        assert sector_total <= config.MAX_SECTOR_PCT + 1e-9, (
+            f"{sector} = {sector_total:.6f} exceeds cap {config.MAX_SECTOR_PCT}"
+        )
+    # Every individual position must also respect its cap
+    assert (target <= config.MAX_POSITION_PCT + 1e-9).all()
+
+
+def test_invariant_position_cap_holds_with_extreme_concentration(monkeypatch):
+    """Adversarial: HRP gives 80% to a single ticker. Output must never
+    have any position above MAX_POSITION_PCT + 1e-9."""
+    returns = make_returns()
+    scores = make_scores(returns)
+    sector_map = {t: f"Sector{i}" for i, t in enumerate(returns.columns)}
+
+    import src.portfolio.construction as cons
+
+    def extreme_hrp(ret: pd.DataFrame) -> pd.Series:
+        cols = ret.columns.tolist()
+        w = pd.Series(0.20 / (len(cols) - 1), index=cols)
+        w.iloc[0] = 0.80
+        return w / w.sum()
+
+    monkeypatch.setattr(cons, "hrp_weights", extreme_hrp)
+
+    target = build_portfolio(
+        scores=scores,
+        sector_map=sector_map,
+        current_weights=pd.Series(dtype=float),
+        prices=returns,
+    )
+
+    assert (target <= config.MAX_POSITION_PCT + 1e-9).all(), (
+        f"Positions above cap:\n{target[target > config.MAX_POSITION_PCT]}"
+    )
+    # Shortfall (if any) must be cash, never leverage
+    assert target.sum() <= 1.0 + 1e-9
+
+
+def test_invariant_turnover_cap_holds_on_full_portfolio_swap():
+    """Adversarial: current book holds 25 tickers the new target doesn't
+    want at all (a full swap = ~100% unconstrained turnover). The result
+    must keep turnover <= TURNOVER_CAP + 1e-9 — the old renormalise-at-the-
+    end could quietly break the budget and move rejected tickers."""
+    n_total = 50
+    rng = np.random.default_rng(7)
+    tickers = [f"T{i:02d}" for i in range(n_total)]
+    returns = pd.DataFrame(rng.standard_normal((120, n_total)), columns=tickers)
+    # New scores favour T00..T24; current book holds T25..T49 equally.
+    scores = pd.Series(range(n_total, 0, -1), index=tickers, dtype=float)
+    sector_map = {t: f"Sector{i % 10}" for i, t in enumerate(tickers)}
+    current = pd.Series(1.0 / 25, index=tickers[25:], dtype=float)
+
+    target = build_portfolio(
+        scores=scores,
+        sector_map=sector_map,
+        current_weights=current,
+        prices=returns,
+    )
+
+    actual_turnover = _turnover(target, current)
+    assert actual_turnover <= config.TURNOVER_CAP + 1e-9, (
+        f"Turnover {actual_turnover:.4f} exceeds cap {config.TURNOVER_CAP}"
+    )
+    # Weights must never exceed 1.0 in total (shortfall is cash, never leverage)
+    assert target.sum() <= 1.0 + 1e-9
+
+
+def test_invariant_all_caps_hold_together(monkeypatch):
+    """Adversarial combo: concentrated HRP + hostile current book. All three
+    invariants (sector, position, turnover) must hold simultaneously."""
+    n_total = 40
+    rng = np.random.default_rng(11)
+    tickers = [f"T{i:02d}" for i in range(n_total)]
+    returns = pd.DataFrame(rng.standard_normal((120, n_total)), columns=tickers)
+    scores = pd.Series(range(n_total, 0, -1), index=tickers, dtype=float)
+    # 8 sectors of 5 — feasible under the 30% sector cap.
+    sector_map = {t: f"Sector{i // 5}" for i, t in enumerate(tickers)}
+    # Current book: everything parked in the 15 lowest-score tickers.
+    current = pd.Series(1.0 / 15, index=tickers[-15:], dtype=float)
+
+    import src.portfolio.construction as cons
+
+    def hostile_hrp(ret: pd.DataFrame) -> pd.Series:
+        cols = ret.columns.tolist()
+        w = pd.Series(0.30 / (len(cols) - 2), index=cols)
+        w.iloc[0] = 0.40   # way over the 8% position cap
+        w.iloc[1] = 0.30   # also over
+        return w / w.sum()
+
+    monkeypatch.setattr(cons, "hrp_weights", hostile_hrp)
+
+    target = build_portfolio(
+        scores=scores,
+        sector_map=sector_map,
+        current_weights=current,
+        prices=returns,
+    )
+
+    # Position cap
+    assert (target <= config.MAX_POSITION_PCT + 1e-9).all()
+    # Sector cap
+    for sector in set(sector_map.values()):
+        sector_total = target[[t for t in target.index if sector_map[t] == sector]].sum()
+        assert sector_total <= config.MAX_SECTOR_PCT + 1e-9
+    # Turnover cap
+    assert _turnover(target, current) <= config.TURNOVER_CAP + 1e-9
+    # Never levered
+    assert target.sum() <= 1.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
 # test_build_short_portfolio
 # ---------------------------------------------------------------------------
 

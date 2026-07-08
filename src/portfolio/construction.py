@@ -29,21 +29,86 @@ def _apply_sector_cap(weights: pd.Series, sector_map: dict[str, str]) -> pd.Seri
     """Scale down any sector whose total weight exceeds MAX_SECTOR_PCT.
 
     If sector X has 40% but the cap is 30%, every ticker in sector X is
-    multiplied by 30/40 = 0.75 so the sector total hits exactly 30%.
-    Weights are then renormalised so they still sum to 1.
+    multiplied by 30/40 = 0.75 so the sector total hits exactly 30% —
+    but then renormalising once (dividing everyone by the new, smaller
+    total so the portfolio still sums to 1.0) scales sector X back UP
+    again, proportionally with everyone else, pushing it back over the
+    cap. Proven case: sector X at 60% with a 30% cap becomes 42.9% after
+    one cap-then-renormalise pass, not 30%.
+
+    Analogy: it's like turning down one loud speaker in a room, then
+    turning UP the master volume to compensate for the room feeling
+    quieter overall — the speaker you just turned down creeps back up too.
+
+    Fix: instead of renormalising, move the trimmed-off weight into sectors
+    that still have headroom below the cap. If every sector is full (e.g.
+    only 3 sectors exist, and 3 x 30% = 90% < 100%), the leftover weight is
+    deliberately NOT reinvested — it stays as cash. Holding cash is always
+    an acceptable outcome for a risk limit; breaching the cap (or crashing)
+    is not.
     """
     w = weights.copy()
-    for sector in set(sector_map.values()):
-        tickers_in_sector = [t for t in w.index if sector_map.get(t) == sector]
-        sector_total = w[tickers_in_sector].sum()
-        if sector_total > config.MAX_SECTOR_PCT:
-            # Scale every ticker in the sector proportionally down to the cap
-            scale = config.MAX_SECTOR_PCT / sector_total
-            w[tickers_in_sector] *= scale
-    # Renormalise so all weights still sum to 1.0
-    total = w.sum()
-    if total > 0:
-        w /= total
+    cap = config.MAX_SECTOR_PCT
+    tol = 1e-9
+    sectors = set(sector_map.values())
+    max_iterations = 20
+
+    def sector_tickers(sector: str) -> list[str]:
+        return [t for t in w.index if sector_map.get(t) == sector]
+
+    for _ in range(max_iterations):
+        # 1. Trim every over-cap sector down to exactly the cap, pooling
+        #    the trimmed-off weight ("excess") for redistribution.
+        excess = 0.0
+        for sector in sectors:
+            tickers = sector_tickers(sector)
+            sector_total = float(w[tickers].sum())
+            if sector_total > cap + tol:
+                w[tickers] *= cap / sector_total
+                excess += sector_total - cap
+
+        if excess <= tol:
+            break  # nothing was over the cap — done
+
+        # 2. Hand the excess to sectors with room left, in proportion to how
+        #    much room each has. Capping the hand-out at each sector's
+        #    headroom means a receiving sector can never itself go over the
+        #    cap, so this converges instead of ping-ponging.
+        headrooms = {}
+        for sector in sectors:
+            # A sector with no tickers actually held can't receive weight —
+            # skip it (sector_map often covers the whole universe, while the
+            # portfolio only holds the selected top N).
+            if not sector_tickers(sector):
+                continue
+            room = cap - float(w[sector_tickers(sector)].sum())
+            if room > tol:
+                headrooms[sector] = room
+        total_headroom = sum(headrooms.values())
+        if total_headroom <= tol:
+            break  # every sector is full — the excess stays as cash
+
+        to_distribute = min(excess, total_headroom)
+        for sector, room in headrooms.items():
+            tickers = sector_tickers(sector)
+            share = to_distribute * (room / total_headroom)
+            sector_total = float(w[tickers].sum())
+            if sector_total > tol:
+                # Pro-rata within the sector, preserving relative sizes.
+                w[tickers] += share * (w[tickers] / sector_total)
+            else:
+                # Sector has tickers but ~zero weight: split equally.
+                w[tickers] += share / len(tickers)
+        # Any excess beyond total headroom is simply not reinvested (cash).
+
+    # Final safety trim: after the bounded loop, hard-scale any sector still
+    # a hair over the cap (floating-point dust). The tiny shortfall becomes
+    # cash — never crash a live rebalance over an infeasible cap.
+    for sector in sectors:
+        tickers = sector_tickers(sector)
+        sector_total = float(w[tickers].sum())
+        if sector_total > cap + tol:
+            w[tickers] *= cap / sector_total
     return w
 
 
@@ -77,30 +142,62 @@ def _apply_position_cap(weights: pd.Series) -> pd.Series:
             w[under_mask] += excess * (w[under_mask] / under_total)
         # else: all tickers are at the cap — nowhere to redistribute, so just stop
 
-    # Final normalisation to absorb floating-point drift
+    # Final hard safety clip: covers float drift or a ticker still (barely)
+    # over the cap if the loop above hit its 10-iteration limit.
+    w[w > cap] = cap
+
+    # Only renormalise back to sum=1.0 if doing so does NOT push anything
+    # back over the cap. Dividing by a total < 1.0 inflates every weight —
+    # exactly the "renormalise undoes the cap" bug this task exists to fix
+    # (see src/risk/engine.py for the proven case). If redistribution above
+    # left no room (every ticker sitting at the cap) the total will be
+    # < 1.0; that gap is left unallocated — i.e. held as cash — rather than
+    # forced back into already-capped positions.
     total = w.sum()
     if total > 0:
-        w /= total
+        candidate = w / total
+        if (candidate <= cap + 1e-9).all():
+            w = candidate
+        # else: leave `w` as-is; (1 - total) sits in cash.
     return w
 
 
 def _apply_turnover_cap(
     target: pd.Series,
     current: pd.Series,
-    scores: pd.Series,
 ) -> pd.Series:
     """Limit two-way turnover to TURNOVER_CAP.
 
     Turnover = sum(|target - current|) / 2.
 
     When turnover already fits within the cap, return `target` unchanged.
+    When it exceeds the cap, ALL trade deltas are shrunk by the same factor
+    (TURNOVER_CAP / turnover) so the portfolio moves partway from `current`
+    toward `target` and lands exactly on the turnover budget.
 
-    When it exceeds the cap, we greedily accept the *largest* individual
-    changes first (they carry the most information) until the cap is hit,
-    then revert the rest to their current weights.  The result is renormalised
-    to sum to 1.
+    Analogy: you planned a 100-mile road trip but only have fuel for 40
+    miles — so you drive 40% of the way along the SAME route, rather than
+    picking a few favourite stops and teleporting to them.
 
-    Note: if `current` is empty (first day), skip the cap entirely.
+    Why proportional shrink rather than the old greedy accept/reject +
+    renormalise?  Two proven defects in the old approach:
+      1. The final renormalisation rescaled the *rejected* tickers too,
+         moving them off the current weights we had deliberately frozen,
+         and could push turnover back over the cap — the same "renormalise
+         undoes the control" bug fixed in the sector/position caps above.
+      2. Even without renormalising, accepting big buys while rejecting the
+         offsetting sells makes the weights sum to MORE than 1.0 — that's
+         leverage, which this long-only book must never have.
+    The proportional shrink has neither problem, provably: the result is
+    the convex mix (1-s)*current + s*target with s in (0, 1), so it stays
+    non-negative, its turnover is exactly s * original = TURNOVER_CAP, and
+    its total sits between sum(current) and sum(target) — never above 1.0.
+    If `target` holds some cash (sum < 1, e.g. after a cap couldn't
+    redistribute), the result holds proportionally less of that cash; no
+    renormalisation is needed or done.
+
+    Note: if `current` is empty (first day), skip the cap entirely —
+    there's no existing book to protect from churn.
     """
     if current.empty:
         return target
@@ -110,37 +207,20 @@ def _apply_turnover_cap(
     t = target.reindex(all_tickers, fill_value=0.0)
     c = current.reindex(all_tickers, fill_value=0.0)
 
-    delta = (t - c).abs()
-    turnover = delta.sum() / 2.0
+    delta = t - c
+    turnover = float(delta.abs().sum()) / 2.0
 
     if turnover <= config.TURNOVER_CAP:
         return t  # already within budget
 
-    # Sort tickers by size of change (largest first — highest priority)
-    priority_order = delta.sort_values(ascending=False).index
+    # Shrink every delta by the same factor so total turnover lands exactly
+    # on the cap. s < 1 by construction here (turnover > cap).
+    s = config.TURNOVER_CAP / turnover
+    result = c + delta * s
 
-    budget_used = 0.0
-    accepted = pd.Series(False, index=all_tickers)
-
-    for ticker in priority_order:
-        change_cost = delta[ticker] / 2.0  # two-way cost of this one change
-        if budget_used + change_cost <= config.TURNOVER_CAP:
-            accepted[ticker] = True
-            budget_used += change_cost
-        # else: leave this ticker at its current weight
-
-    # Build the result: accepted tickers take their target weight,
-    # rejected tickers stay at their current weight
-    result = c.copy()
-    result[accepted] = t[accepted]
-
-    # Renormalise to 1.0 (the mix of kept current + accepted target may not sum to 1)
-    total = result.sum()
-    if total > 0:
-        result /= total
-
-    # Drop zero-weight tickers that were never in target or current
-    return result[result > 0]
+    # Drop dust: tickers whose weight is (numerically) zero were never in
+    # target or current, or fully exited.
+    return result[result > 1e-12]
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +252,11 @@ def build_portfolio(
     Returns
     -------
     pd.Series
-        Target weights indexed by ticker, summing to 1.0.
+        Target weights indexed by ticker. Sums to 1.0 in the normal case,
+        but may sum to slightly less when a cap could not redistribute all
+        excess weight or the turnover cap froze some tickers — the
+        shortfall is deliberately held as cash rather than forced back
+        into capped positions.
     """
     # ------------------------------------------------------------------
     # Step 1: Select top N tickers by score
@@ -202,15 +286,17 @@ def build_portfolio(
     # ------------------------------------------------------------------
     weights = _apply_position_cap(weights)
 
-    # ------------------------------------------------------------------
-    # Step 5: Renormalise (belt-and-suspenders after the caps)
-    # ------------------------------------------------------------------
-    weights = weights / weights.sum()
+    # NOTE: no blind renormalisation between the caps and the turnover cap.
+    # The old "Step 5" divided the weights by their sum, which inflates
+    # every weight and can push capped positions straight back over their
+    # limits — the exact bug the caps exist to prevent. Each cap helper now
+    # handles its own normalisation safely; any shortfall below 1.0 is
+    # intentional cash.
 
     # ------------------------------------------------------------------
-    # Step 6: Turnover cap
+    # Step 5: Turnover cap
     # ------------------------------------------------------------------
-    weights = _apply_turnover_cap(weights, current_weights, scores)
+    weights = _apply_turnover_cap(weights, current_weights)
 
     return weights
 

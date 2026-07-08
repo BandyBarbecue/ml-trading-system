@@ -50,6 +50,41 @@ def test_cross_sectional_buy_vs_sell(tmp_path, monkeypatch):
     assert msft_val < 0
 
 
+def test_transaction_lagged_by_two_business_days(tmp_path, monkeypatch):
+    """A trade must not count on its own transaction date — Form 4 filings
+    become public ~2 business days later. It should start counting once its
+    effective (filing) date has arrived.
+    """
+    from src.features import insider_features
+
+    trans_date = datetime(2024, 6, 3)  # Monday
+    df = pd.DataFrame([{
+        "ticker": "AAPL", "date": trans_date.strftime("%Y-%m-%d"),
+        "insider_type": "ceo", "transaction_type": "P",
+        "shares": 10000, "value_usd": 1_850_000.0,
+    }])
+    monkeypatch.setattr(config, "INSIDER_FILE", tmp_path / "insider.parquet")
+    df.to_parquet(tmp_path / "insider.parquet", index=False)
+
+    same_day  = trans_date                        # Mon: transaction date itself
+    one_biz_day_later = trans_date + timedelta(days=1)   # Tue: filing still not public
+    effective = trans_date + timedelta(days=2)     # Wed: +2 business days, now public
+
+    dates = pd.DatetimeIndex([same_day, one_biz_day_later, effective])
+    result = insider_features.compute_insider_features(dates, symbols=["AAPL"])
+
+    assert np.isnan(result.loc[same_day, ("insider_score", "AAPL")]), (
+        "Trade must not be visible on its own transaction date"
+    )
+    assert np.isnan(result.loc[one_biz_day_later, ("insider_score", "AAPL")]), (
+        "Trade must not be visible before the +2 business day filing lag elapses"
+    )
+    val = result.loc[effective, ("insider_score", "AAPL")]
+    assert not np.isnan(val) and val > 0, (
+        "Trade must be visible once its effective (filing) date is reached"
+    )
+
+
 def test_empty_insider_file_returns_empty(tmp_path, monkeypatch):
     from src.features import insider_features
 

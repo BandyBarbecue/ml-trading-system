@@ -85,6 +85,32 @@ def test_sue_nan_when_insufficient_history():
     )
 
 
+def test_sue_excluded_on_announcement_day():
+    """SUE must not leak the announcement-day report itself (AMC reporting).
+
+    Most S&P 500 companies report After Market Close, so day T's close has
+    already happened before the earnings news is public. The SUE feature on
+    day T (the announcement date) must therefore be computed WITHOUT that
+    day's own report; it should only become available starting day T+1.
+    """
+    dates = pd.bdate_range("2023-02-01", "2023-02-03")
+    sue = compute_sue(EARNINGS, dates)
+
+    # On the announcement day itself, the Feb-1 report must not be visible
+    # yet. Falling back to the prior report (2022-11-01, ~92 days earlier,
+    # past the 60-day decay window) means the value should be NaN.
+    val_announce_day = sue.loc["2023-02-01", "AAPL"]
+    assert np.isnan(val_announce_day), (
+        "SUE on the announcement day itself must not use that day's own report"
+    )
+
+    # The very next trading day, the Feb-1 report becomes visible.
+    val_next_day = sue.loc["2023-02-02", "AAPL"]
+    assert not np.isnan(val_next_day), (
+        "SUE should be available starting the trading day after the announcement"
+    )
+
+
 def test_sue_columns_match_tickers():
     """Output DataFrame columns should exactly match tickers present in input."""
     dates = pd.bdate_range("2023-02-01", "2023-02-10")

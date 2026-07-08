@@ -25,7 +25,19 @@ FRED_SERIES = ["T10Y2Y", "UNRATE", "FEDFUNDS"]
 
 
 def _fetch_series(series_id: str, start_date: str) -> pd.Series:
-    """Fetch one FRED series as a date-indexed Series."""
+    """Fetch one FRED series as a date-indexed Series.
+
+    Look-ahead warning: FRED's default endpoint keys observations by
+    *observation date* (the period the data describes), not the date the
+    data was actually released/published. E.g. UNRATE for "2024-01-01" is
+    usually not known publicly until early February. Joining this series
+    naively onto a backtest by observation date would leak future
+    information into the past (the model would "know" January's
+    unemployment rate on January 1st).
+    TODO: use FRED's `realtime_start`/`realtime_end` params (or an explicit
+    publication-lag shift) to key by release date before using this in any
+    backtest that isn't purely exploratory.
+    """
     params = {
         "series_id":         series_id,
         "observation_start": start_date,
@@ -59,7 +71,12 @@ def update_macro() -> None:
         try:
             frames[series.lower()] = _fetch_series(series, start_date)
         except Exception as exc:
-            log.warning("FRED fetch failed for %s: %s", series, exc)
+            # Don't log str(exc) — for an HTTPError raised by raise_for_status()
+            # that includes the full request URL, which contains FRED_API_KEY
+            # as a query param. Log only the exception type (same guard style
+            # as fetch_earnings.py's error handling).
+            err_type = type(exc).__name__
+            log.warning("FRED fetch failed for %s: %s", series, err_type)
 
     if not frames:
         return

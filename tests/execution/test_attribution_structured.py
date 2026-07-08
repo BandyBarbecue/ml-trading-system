@@ -81,6 +81,52 @@ def test_attribution_empty_proposals_on_no_json(tmp_path, monkeypatch):
     assert result["proposals"] == []
 
 
+def test_equity_change_pct_computed_from_real_curve(tmp_path, monkeypatch):
+    """#17c: the month filter used to compare the RangeIndex against `month`
+    instead of the "date" column, so _equity_change_pct was silently always
+    0.0. With a real equity curve for the target month, the prompt sent to
+    Claude must contain the ACTUAL non-zero return, not +0.0%."""
+    from src.execution import attribution
+
+    monkeypatch.setattr(config, "ATTR_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    # A real +10% move within the target month (2024-05), plus a row from an
+    # adjacent month that must NOT be included in the calculation.
+    curve = pd.DataFrame({
+        "date":   pd.to_datetime(["2024-04-30", "2024-05-01", "2024-05-15", "2024-05-30"]),
+        "equity": [999_999.0,    100_000.0,    105_000.0,     110_000.0],
+    })
+    curve.to_parquet(tmp_path / "equity_curve.parquet", index=False)
+
+    mock_model = MagicMock()
+    mock_model.feature_name_ = ["mom_1m"]
+    fm = pd.DataFrame({
+        "date": pd.to_datetime(["2024-05-01"]),
+        "ticker": ["AAPL"],
+        "mom_1m": [0.5],
+        "target": [0.7],
+    })
+
+    with patch("src.execution.attribution.anthropic.Anthropic") as MockClient:
+        mock_client = MagicMock()
+        MockClient.return_value = mock_client
+        mock_client.messages.create.return_value.content = [
+            MagicMock(text="Report.\n```json\n[]\n```")
+        ]
+        with patch("src.execution.attribution.shap") as mock_shap:
+            mock_shap.TreeExplainer.return_value.shap_values.return_value = [[0.1]]
+            attribution.generate_attribution_report(mock_model, fm, month="2024-05")
+
+    call_kwargs = mock_client.messages.create.call_args
+    prompt = call_kwargs.kwargs["messages"][0]["content"]
+    # (110,000 - 100,000) / 100,000 = +10.0% — the ATTRIBUTION_PROMPT format
+    # string renders this as "+10.0%".
+    assert "+10.0%" in prompt, (
+        f"Expected a real +10.0% equity change in the prompt, got:\n{prompt}"
+    )
+
+
 def test_attribution_saves_markdown(tmp_path, monkeypatch):
     from src.execution import attribution
 
