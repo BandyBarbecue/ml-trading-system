@@ -7,6 +7,10 @@
 # own FileHandler. This script adds start/end markers around that output.
 # We do NOT use "2>&1 | Tee-Object" because that pipeline causes PowerShell 5.1
 # to corrupt $LASTEXITCODE and would double-write to the log file.
+#
+# Write-Log uses Add-Content -Encoding UTF8, NOT Tee-Object -FilePath: in
+# PowerShell 5.1 Tee-Object writes UTF-16, while Python's FileHandler appends
+# UTF-8 to the SAME file — the mixed encodings made the log unreadable mojibake.
 
 param(
     [switch]$DryRun
@@ -27,7 +31,9 @@ $LogFile = Join-Path $LogDir "daily_run_$(Get-Date -Format 'yyyy-MM-dd').log"
 function Write-Log {
     param([string]$Message)
     $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$stamp  $Message" | Tee-Object -FilePath $LogFile -Append
+    $line = "$stamp  $Message"
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8
 }
 
 if ($DryRun) {

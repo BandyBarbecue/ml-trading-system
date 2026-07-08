@@ -10,13 +10,10 @@ Tasks created:
     TradingSystem-DailyRun    — 08:30 ET Mon-Fri
     TradingSystem-Intraday    — 09:25 ET Mon-Fri
 
-IMPORTANT — prefer scripts/create_task.ps1 instead of this script.
-`schtasks /TR` is a raw cmd.exe command line with no first-class concept of
-"working directory" or a timezone, so this script has to work around both
-limitations (see the two blocks of comments below). create_task.ps1 uses
-PowerShell's Register-ScheduledTask, which supports an explicit
--WorkingDirectory and is much easier to inspect/re-register correctly. This
-script is kept for environments where only schtasks is available.
+This is the CANONICAL way to register the tasks. (An older create_task.ps1
+was removed: it registered "08:30" as London wall-clock time — i.e. 03:30 ET —
+and only covered the DailyRun task. This script converts ET to London time
+explicitly; see _et_to_london_clock.)
 """
 
 import subprocess
@@ -92,9 +89,6 @@ def main() -> None:
     print(f"Python exe: {python_exe}")
     print(f"Start date: {start_date}")
     print(f"Mode: {'DRY RUN' if check_mode else 'REGISTER'}")
-    print("NOTE: scripts/create_task.ps1 is the preferred way to register these")
-    print("      tasks — it supports a real working directory and is easier to")
-    print("      audit. Use this script only if PowerShell registration isn't available.")
     print("=" * 70)
     print()
 
