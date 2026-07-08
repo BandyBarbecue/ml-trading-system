@@ -118,7 +118,15 @@ def classify_regime(macro_df: pd.DataFrame) -> RegimeLabel:
             max_tokens=128,
             messages=[{"role": "user", "content": REGIME_PROMPT.format(macro_summary=macro_summary)}],
         )
-        parsed = json.loads(response.content[0].text)
+        # Claude sometimes wraps the JSON in ```json ... ``` markdown fences —
+        # strip those before parsing (same guard as nlp_features.py). Without
+        # this, every classification failed and silently fell back to
+        # "sideways", disabling regime modulation entirely.
+        raw_text = response.content[0].text.strip()
+        if raw_text.startswith("```"):
+            lines = [l for l in raw_text.splitlines() if not l.strip().startswith("```")]
+            raw_text = "\n".join(lines).strip()
+        parsed = json.loads(raw_text)
         regime = parsed.get("regime", "sideways")
         if regime not in VALID_REGIMES:
             regime = "sideways"

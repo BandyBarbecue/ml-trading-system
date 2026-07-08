@@ -7,8 +7,9 @@ Series used:
   UNRATE  — US unemployment rate. Rising rate = potential recession.
   FEDFUNDS — Federal funds rate. High rates = tighter financial conditions.
 
-FRED is completely free. No API key needed for 120 requests/min.
-Optional FRED_API_KEY in .env raises the rate limit.
+FRED is completely free, but an API key IS required (the API returns 400
+without one) — set FRED_API_KEY in .env. Keys are free from
+https://fred.stlouisfed.org/docs/api/api_key.html.
 """
 
 import logging

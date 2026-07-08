@@ -85,7 +85,8 @@ trading-research/
 │   ├── data/
 │   │   ├── fetch_prices.py      ← 500-symbol daily bars → parquet
 │   │   ├── fetch_news.py        ← Alpaca News API → daily parquet
-│   │   ├── fetch_earnings.py    ← FMP API → earnings.parquet
+│   │   ├── fetch_earnings.py    ← yfinance → earnings.parquet (was FMP —
+│   │   │                           endpoint retired for post-2025 accounts)
 │   │   ├── fetch_vix.py         ← yfinance ^VIX
 │   │   ├── fetch_intraday.py    ← Alpaca 30-min bars
 │   │   └── sp500_universe.py    ← Wikipedia scraper + cache

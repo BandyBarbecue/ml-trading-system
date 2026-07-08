@@ -17,7 +17,10 @@ EARNINGS_FILE = DATA_DIR / "earnings" / "earnings.parquet"
 FUNDAMENTALS_FILE = DATA_DIR / "fundamentals" / "fundamentals.parquet"
 INSIDER_FILE      = DATA_DIR / "insider"       / "insider.parquet"
 REGIME_FILE       = DATA_DIR / "features"      / "regime.parquet"
-FRED_BASE_URL     = "https://api.stlouisfed.gov/fred/series/observations"
+# NOTE: the St. Louis Fed is a Federal Reserve BANK, not a government agency —
+# its domain is stlouisfed.ORG. The previous ".gov" hostname never existed
+# (DNS NXDOMAIN), so every macro fetch had silently failed since day one.
+FRED_BASE_URL     = "https://api.stlouisfed.org/fred/series/observations"
 FRED_API_KEY      = os.getenv("FRED_API_KEY", "")
 
 # Long-short extension — disabled by default until backtest confirms positive IC
