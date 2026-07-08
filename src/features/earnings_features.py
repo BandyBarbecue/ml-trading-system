@@ -33,7 +33,9 @@ def compute_sue(earnings: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFrame
     """Compute a daily SUE score for each ticker across the given date range.
 
     For each date ``d`` and each ticker, we:
-      1. Find all past earnings reports for that ticker on or before ``d``.
+      1. Find all earnings reports for that ticker that were public by day
+         ``d``'s close: strictly before ``d``, plus ``d`` itself if the
+         report was released Before Market Open (report_time == "bmo").
       2. Require at least MIN_HISTORY reports (otherwise return NaN — not enough
          data to estimate the std of surprises reliably).
       3. Compute SUE = surprise_pct_latest / std(last_8_surprise_pcts).
@@ -43,8 +45,11 @@ def compute_sue(earnings: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFrame
 
     Args:
         earnings: DataFrame with columns
-            ticker (str), date (datetime), surprise_pct (float).
+            ticker (str), date (datetime), surprise_pct (float), and
+            optionally report_time ("bmo"/"amc"/"unknown").
             surprise_pct = (actual - estimated) / |estimated|, or equivalent.
+            If report_time is absent (legacy parquet written before the flag
+            existed), every row is treated as "unknown" (conservative).
         dates: DatetimeIndex of trading dates to evaluate.
 
     Returns:
@@ -55,27 +60,35 @@ def compute_sue(earnings: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFrame
         # Nothing to compute — return an empty DataFrame with the right index
         return pd.DataFrame(index=dates)
 
+    # Report-time flag: was the announcement Before Market Open (BMO) or
+    # After Market Close (AMC)?  Legacy parquet files written before this
+    # column existed simply don't have it — treat every row as "unknown"
+    # rather than crashing (unknown gets the conservative AMC treatment).
+    if "report_time" not in earnings.columns:
+        earnings = earnings.copy()          # don't mutate the caller's frame
+        earnings["report_time"] = "unknown"
+
     result_rows = []
     tickers = earnings["ticker"].unique()
 
     for d in dates:
         row: dict[str, float] = {}
         for ticker in tickers:
-            # All earnings for this ticker strictly BEFORE date d (not <=),
-            # sorted newest-first so iloc[0] is the most recent report.
-            # Why strict "<": most S&P 500 companies report earnings After
-            # Market Close (AMC), so a report dated day T is not public
-            # information until day T+1's session. Using "<=" would let day
-            # T's own announcement leak into day T's feature (look-ahead
-            # bias) at full decay strength (days_since == 0 → decay 1.0).
-            # A proper fix would track a real BMO/AMC flag per report and
-            # only exclude same-day AMC reports — that's a future improvement;
-            # excluding the whole announcement day is the conservative, safe
-            # default in the meantime.
+            # Which reports are *public* by day d's 16:00 ET close?
+            # Our feature timestamp is day T's close, so:
+            #   - BMO reports (~07:00 ET) are public ~7 hours BEFORE the
+            #     close → usable on day T itself (date <= d).
+            #   - AMC reports (~16:30 ET) land ~30 minutes AFTER the close
+            #     → only usable from day T+1 (date < d).  Using them on
+            #     day T would be look-ahead bias.
+            #   - "unknown" is treated like AMC: when in doubt, assume the
+            #     information arrived too late (the conservative choice).
+            ticker_mask = earnings["ticker"] == ticker
+            public_mask = (earnings["date"] < d) | (
+                (earnings["date"] == d) & (earnings["report_time"] == "bmo")
+            )
             hist = (
-                earnings[
-                    (earnings["ticker"] == ticker) & (earnings["date"] < d)
-                ]
+                earnings[ticker_mask & public_mask]
                 .sort_values("date", ascending=False)
             )
 

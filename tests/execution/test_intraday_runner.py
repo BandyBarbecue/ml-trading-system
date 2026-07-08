@@ -496,6 +496,9 @@ def test_run_intraday_stops_at_close(monkeypatch):
         patch("src.execution.risk_state.is_halted", return_value=False),
         patch("src.execution.paper_trader.acquire_run_lock", return_value=True),
         patch("src.execution.paper_trader.release_run_lock"),
+        # 2024-01-15 is MLK Day (a real NYSE holiday) — force the calendar
+        # gate open so this test still exercises the loop-stop behaviour.
+        patch("src.data.market_calendar.is_trading_day", return_value=True),
     ):
         runner_mod.run_intraday(dry_run=True, date="2024-01-15")
 
@@ -549,8 +552,100 @@ def test_run_intraday_refuses_to_start_while_lock_held(monkeypatch):
 
     with (
         patch("src.execution.risk_state.is_halted", return_value=False),
+        # 2024-01-15 is MLK Day — force the calendar gate open so the test
+        # genuinely reaches (and is stopped by) the lock check.
+        patch("src.data.market_calendar.is_trading_day", return_value=True),
         patch("src.execution.paper_trader.acquire_run_lock", return_value=False),
     ):
         runner_mod.run_intraday(dry_run=True, date="2024-01-15")
 
     assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# NYSE calendar gate + early-close handling  (#20)
+# ---------------------------------------------------------------------------
+
+def test_run_intraday_exits_on_non_trading_day(monkeypatch):
+    """On a weekend/holiday, run_intraday must exit before acquiring the run
+    lock or processing any bars."""
+    import src.execution.intraday_runner as runner_mod
+
+    called = {"n": 0}
+
+    def fake_run_bar(*a, **kw):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(runner_mod, "run_bar", fake_run_bar)
+    # If the calendar gate didn't short-circuit, this would loop forever.
+    monkeypatch.setattr(runner_mod, "_is_market_hours", lambda now: True)
+
+    with (
+        patch("src.execution.risk_state.is_halted", return_value=False),
+        patch("src.data.market_calendar.is_trading_day", return_value=False),
+        patch("src.execution.paper_trader.acquire_run_lock") as mock_acquire,
+    ):
+        runner_mod.run_intraday(dry_run=True, date="2024-01-15")
+        mock_acquire.assert_not_called()
+
+    assert called["n"] == 0
+
+
+def test_effective_close_uses_early_close(monkeypatch):
+    """On a 13:00 ET half-day, the effective 'stop trading' time must be
+    12:50 (10 min before the early bell), not the hardcoded 15:50."""
+    from datetime import time as dt_time
+    from src.execution.intraday_runner import _effective_close_hm
+
+    with patch("src.data.market_calendar.market_close_et",
+               return_value=dt_time(13, 0)):
+        assert _effective_close_hm(_et(11, 0)) == (12, 50)
+
+
+def test_is_market_hours_respects_early_close():
+    """At 13:30 ET on a half-day the market has already closed — the loop
+    must see 'doors shut' even though 13:30 < the normal 15:50 close."""
+    from datetime import time as dt_time
+    from src.execution.intraday_runner import _is_market_hours
+
+    with patch("src.data.market_calendar.market_close_et",
+               return_value=dt_time(13, 0)):
+        assert _is_market_hours(_et(13, 30)) is False   # after early close
+        assert _is_market_hours(_et(11, 0)) is True     # mid-morning still open
+
+
+def test_is_final_bar_respects_early_close():
+    """At 12:30 on a half-day the next boundary (13:00) is past the 12:50
+    effective close → this IS the final bar and 'eod' should liquidate."""
+    from datetime import time as dt_time
+    from src.execution.intraday_runner import _is_final_bar
+
+    with patch("src.data.market_calendar.market_close_et",
+               return_value=dt_time(13, 0)):
+        assert _is_final_bar(_et(12, 30)) is True
+        assert _is_final_bar(_et(11, 0)) is False
+
+
+def test_effective_close_falls_back_when_calendar_fails():
+    """If the calendar lookup raises, the runner must fall back to
+    config.INTRADAY_CLOSE_TIME rather than crash mid-session."""
+    from src.execution.intraday_runner import _effective_close_hm
+
+    expected = tuple(map(int, config.INTRADAY_CLOSE_TIME.split(":")))
+
+    with patch("src.data.market_calendar.market_close_et",
+               side_effect=RuntimeError("calendar exploded")):
+        assert _effective_close_hm(_et(11, 0)) == expected
+
+
+def test_effective_close_falls_back_on_non_trading_day():
+    """market_close_et returns None on a non-trading day — fall back to the
+    config value (the run_intraday gate exits earlier anyway; this just
+    keeps the helper total)."""
+    from src.execution.intraday_runner import _effective_close_hm
+
+    expected = tuple(map(int, config.INTRADAY_CLOSE_TIME.split(":")))
+
+    with patch("src.data.market_calendar.market_close_et", return_value=None):
+        assert _effective_close_hm(_et(11, 0)) == expected

@@ -60,16 +60,48 @@ def _now_et() -> datetime:
 # Time helpers
 # ---------------------------------------------------------------------------
 
+def _effective_close_hm(now: datetime) -> tuple[int, int]:
+    """Return (hour, minute) for today's "stop trading" time.
+
+    Normally this is 10 minutes before the actual NYSE close (16:00 ET ->
+    15:50), which is exactly what config.INTRADAY_CLOSE_TIME hardcodes. On
+    an early-close day (e.g. the day after Thanksgiving, actual close
+    13:00 ET) it becomes 10 minutes before THAT bell (12:50) instead —
+    otherwise the runner would keep polling for hours after the market has
+    already shut.
+
+    The calendar lookup is wrapped in try/except because this runs on every
+    polling loop iteration: a calendar bug or bad install must never crash
+    the intraday runner mid-session — it just falls back to the static
+    config value, same as before this gate existed.
+    """
+    try:
+        from src.data.market_calendar import market_close_et
+        close = market_close_et(now.date())
+        if close is not None:
+            # "10 minutes before" via minute arithmetic — avoids pulling in
+            # timedelta just for this one subtraction.
+            total_minutes = close.hour * 60 + close.minute - 10
+            return divmod(total_minutes, 60)
+    except Exception as exc:
+        logger.warning(
+            "market_close_et lookup failed (%s) — falling back to "
+            "config.INTRADAY_CLOSE_TIME.", exc,
+        )
+
+    return tuple(map(int, config.INTRADAY_CLOSE_TIME.split(":")))
+
+
 def _is_market_hours(now: datetime) -> bool:
-    """True if *now* is between 09:30 and 15:50 US/Eastern (inclusive start).
+    """True if *now* is between 09:30 and the effective close US/Eastern
+    (inclusive start, exclusive end — see _effective_close_hm).
 
     *now* must already be timezone-aware.  If it is naive (no tzinfo), we
     assume it is already in ET.
 
     Think of this as the "are the doors open?" check before each patrol round.
     """
-    # Parse the close time from config ("15:50" → hour=15, minute=50).
-    close_h, close_m = map(int, config.INTRADAY_CLOSE_TIME.split(":"))
+    close_h, close_m = _effective_close_hm(now)
 
     # Work entirely in (hour, minute) to avoid date arithmetic.
     hm = (now.hour, now.minute)
@@ -112,18 +144,19 @@ def _next_bar_time(now: datetime) -> datetime:
 
 
 def _is_final_bar(now: datetime) -> bool:
-    """True if the NEXT 30-minute boundary is at or past INTRADAY_CLOSE_TIME —
-    i.e. this is the last bar that will be processed today.
+    """True if the NEXT 30-minute boundary is at or past today's effective
+    close time — i.e. this is the last bar that will be processed today.
 
-    Bars are 30-min aligned but INTRADAY_CLOSE_TIME (15:50) usually isn't, so
-    we can't just compare `now` to the close time directly: the loop's outer
+    Bars are 30-min aligned but the effective close (15:50 normally, 12:50 on
+    an early-close day — see _effective_close_hm) usually isn't, so we can't
+    just compare `now` to the close time directly: the loop's outer
     `_is_market_hours` check already guarantees `now < close_time`, meaning
     "now == close time" never happens. Instead we look ahead to the next
     scheduled bar boundary — if that boundary would be at/after close, this
     bar is the final one, and this is where the "eod" signal should actually
     liquidate (see run_bar).
     """
-    close_h, close_m = map(int, config.INTRADAY_CLOSE_TIME.split(":"))
+    close_h, close_m = _effective_close_hm(now)
     next_bar = _next_bar_time(now)
     return (next_bar.hour, next_bar.minute) >= (close_h, close_m)
 
@@ -378,6 +411,15 @@ def run_intraday(dry_run: bool = False, date: str | None = None) -> None:
             "Trading halted for %s (kill switch fired earlier today) — "
             "refusing to run the intraday loop.", today_str,
         )
+        return
+
+    # --- NYSE calendar gate ------------------------------------------------
+    # Weekends and holidays have no bars to poll. Checked before the run
+    # lock so a Task Scheduler misfire on a holiday exits without even
+    # touching the lock file or the network.
+    from src.data.market_calendar import is_trading_day
+    if not is_trading_day(today_str):
+        logger.info("Market closed today (weekend/holiday) — nothing to do.")
         return
 
     # --- Run lock ----------------------------------------------------------

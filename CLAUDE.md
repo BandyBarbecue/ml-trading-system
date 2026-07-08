@@ -50,11 +50,18 @@ The system is self-improving in three safe ways:
 5. **Secrets stay in `.env`.** Never hardcode API keys. `.env` is gitignored.
 6. **Each module has one job.** Data layer → features → ML → portfolio → risk → execution.
    Modules talk through DataFrames. None knows the internals of another.
-7. **Known survivorship bias in the universe.** `sp500_universe.py` uses the *current*
-   S&P 500 constituent list for all historical fetches — delisted/acquired/removed
-   companies never enter the dataset. Backtest numbers are upward-biased until
-   point-in-time constituent history is built; read them with that caveat, don't
-   quote them as if they were leak-free.
+7. **Survivorship bias — backfill half FIXED, price-history half remains.**
+   Point-in-time S&P 500 membership is now built by `src/data/sp500_history.py`
+   (Wikipedia's "Selected changes" table, cached in `data/sp500_changes.parquet` —
+   run `python -m src.data.sp500_history` to build/refresh it). The backfill bias —
+   treating recent index joiners as if they were members throughout history — is
+   fixed: feature ranking (`feature_matrix.py`, `use_pit_universe=True`) and the
+   backtest's candidate universe (`run_backtest.py`, `membership_mask=`) only
+   consider actual members on each date. **Residual limitation:** price history for
+   delisted/acquired ex-members is often unavailable from free feeds, so those names
+   may still be missing from the data even though membership is now correct —
+   backtests remain somewhat upward-biased. `sp500_history.warn_missing_price_history()`
+   logs exactly which ex-member tickers have no price parquet in `data/prices/`.
 
 ## Architecture
 

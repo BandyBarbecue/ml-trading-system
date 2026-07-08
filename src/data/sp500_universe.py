@@ -93,11 +93,12 @@ def get_symbols(refresh: bool = False) -> list[str]:
     global _survivorship_warned
     if not _survivorship_warned:
         log.warning(
-            "sp500_universe.get_symbols() returns CURRENT S&P 500 members "
-            "applied to historical data — this is survivorship-biased. "
-            "Delisted/removed/acquired companies are missing from the "
-            "backtest sample, so results are upward-biased vs. a true "
-            "point-in-time strategy. Read backtest numbers with this in mind."
+            "sp500_universe.get_symbols() returns CURRENT S&P 500 members. "
+            "Point-in-time membership masking (src/data/sp500_history.py) now "
+            "corrects backfill bias in the feature matrix and backtest, but "
+            "price HISTORY for delisted/acquired ex-members is often missing "
+            "from free data feeds, so a residual survivorship tilt remains. "
+            "Read backtest numbers with this in mind."
         )
         _survivorship_warned = True
 

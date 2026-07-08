@@ -17,6 +17,30 @@ import pandas as pd
 import config
 
 
+def _parse_report_time(raw: object) -> str:
+    """Normalise a report-time field into "bmo" / "amc" / "unknown".
+
+    Why this matters: a Before-Market-Open (BMO) report is public ~7 hours
+    before that day's 16:00 ET close, so it is legitimate information for
+    day-T features.  An After-Market-Close (AMC) report is NOT public until
+    ~30 minutes after the close, so using it on day T would be look-ahead
+    bias.  When we can't tell, we store "unknown" and the feature code
+    treats it like AMC (the conservative choice).
+
+    Note: FMP's /earnings-surprises endpoint currently returns no time field
+    at all, so in practice this yields "unknown" for every row — but we parse
+    defensively in case the endpoint (or a future data source) provides one.
+    """
+    if not isinstance(raw, str):
+        return "unknown"
+    value = raw.strip().lower()
+    # FMP's earnings-calendar uses "bmo"/"amc"; accept only those two exactly
+    # and treat anything else ("--", "", "dmh", ...) as unknown.
+    if value in ("bmo", "amc"):
+        return value
+    return "unknown"
+
+
 def _fetch_symbol_earnings(ticker: str) -> list[dict]:
     """Fetch EPS surprise history for one ticker from FMP.
 
@@ -43,7 +67,7 @@ def update_earnings(symbols: list[str] | None = None) -> None:
 
     Output:
         config.EARNINGS_FILE — columns: ticker, date, actual_eps,
-        estimated_eps, surprise_pct.
+        estimated_eps, surprise_pct, report_time ("bmo"/"amc"/"unknown").
     """
     from src.data.sp500_universe import get_symbols
 
@@ -100,6 +124,9 @@ def update_earnings(symbols: list[str] | None = None) -> None:
                 "actual_eps": float(actual),
                 "estimated_eps": float(estimated),
                 "surprise_pct": (float(actual) - float(estimated)) / abs(float(estimated)),
+                # When the report was released relative to the trading session.
+                # BMO reports may be used on day T; AMC/unknown only from T+1.
+                "report_time": _parse_report_time(item.get("time")),
             })
 
     if not rows:
@@ -108,6 +135,11 @@ def update_earnings(symbols: list[str] | None = None) -> None:
 
     new_df = pd.DataFrame(rows)
     combined = pd.concat([existing, new_df], ignore_index=True)
+
+    # Legacy rows written before report_time existed come out of the concat
+    # as NaN in that column — backfill them to "unknown" so the parquet is
+    # always a clean string column with only three possible values.
+    combined["report_time"] = combined["report_time"].fillna("unknown")
 
     # Deduplicate on (ticker, date) — keep the most recent version of any row.
     combined = combined.drop_duplicates(subset=["ticker", "date"], keep="last")

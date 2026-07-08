@@ -40,6 +40,7 @@ log = logging.getLogger(__name__)
 def build_feature_matrix(
     symbols: list[str],
     dates: pd.DatetimeIndex,
+    use_pit_universe: bool = True,
 ) -> pd.DataFrame:
     """Assemble all features into a tidy long-format DataFrame for ML.
 
@@ -57,6 +58,11 @@ def build_feature_matrix(
     Args:
         symbols: List of ticker strings (e.g. ["AAPL", "MSFT"]).
         dates:   DatetimeIndex of trading dates to include in the matrix.
+        use_pit_universe: If True (default) and data/sp500_changes.parquet
+            exists, drop (date, ticker) rows where the ticker was NOT an
+            S&P 500 member on that date (point-in-time universe — fixes the
+            backfill half of survivorship bias, see CLAUDE.md rule 7).
+            If the parquet is missing we warn once and proceed unmasked.
 
     Returns:
         Long-format DataFrame.  Empty DataFrame if no price data is available.
@@ -76,6 +82,14 @@ def build_feature_matrix(
         dates = pd.DatetimeIndex(dates)
     if dates.tzinfo is not None:
         dates = dates.tz_localize(None)
+
+    # --- 0. Point-in-time membership mask (survivorship-bias fix) ---
+    # load_membership_mask returns None (warning once) if the changes parquet
+    # hasn't been built yet — the pipeline must never crash over this.
+    membership_mask: pd.DataFrame | None = None
+    if use_pit_universe:
+        from src.data.sp500_history import load_membership_mask
+        membership_mask = load_membership_mask(dates, list(symbols))
 
     # --- 1. Price features ---
     # load_all_prices silently skips any symbol whose parquet doesn't exist yet.
@@ -116,6 +130,23 @@ def build_feature_matrix(
     # the 20-day-ahead value at your current position.
     fwd_ret = close_wide.pct_change(TARGET_HORIZON, fill_method=None).shift(-TARGET_HORIZON)
 
+    # Apply the membership mask BEFORE ranking: a rank answers "who beat whom
+    # within the index?", so non-members must not take part in the contest.
+    # If we ranked first and dropped rows later, the surviving ranks would
+    # still have been computed against phantom competitors. NaN cells are
+    # simply skipped by rank(), which is exactly what we want.
+    if membership_mask is not None:
+        # Align the mask onto fwd_ret's own date index / tickers. ffill covers
+        # price dates that fall between mask dates; leading gaps become False.
+        aligned = (
+            membership_mask
+            .reindex(index=fwd_ret.index, method="ffill")
+            .reindex(columns=fwd_ret.columns)
+            .fillna(False)
+            .astype(bool)
+        )
+        fwd_ret = fwd_ret.where(aligned)
+
     # rank(pct=True) gives percentile ranks across the universe for each date.
     # A stock ranked 0.9 beat 90% of the universe over the next 20 days.
     target = fwd_ret.rank(axis=1, pct=True)
@@ -133,6 +164,12 @@ def build_feature_matrix(
             continue
 
         for ticker in symbols:
+            # Point-in-time universe: skip (date, ticker) pairs where the
+            # ticker was not an index member — it would not have been a
+            # candidate on that day, so it must not appear in training data.
+            if membership_mask is not None and not bool(membership_mask.at[date, ticker]):
+                continue
+
             row: dict = {"date": date, "ticker": ticker}
 
             # Price features — stored as (feature, ticker) MultiIndex columns.

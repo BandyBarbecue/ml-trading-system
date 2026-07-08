@@ -452,6 +452,45 @@ def test_no_kill_switch_no_halt_flag(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# NYSE calendar gate  (#20)
+# ---------------------------------------------------------------------------
+
+def test_run_daily_exits_early_on_non_trading_day(monkeypatch, tmp_path):
+    """On a weekend/holiday, run_daily must exit before acquiring the run
+    lock or fetching anything — the calendar gate short-circuits the whole
+    pipeline."""
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True)
+
+    # Force the calendar gate closed regardless of the fixture date.
+    monkeypatch.setattr("src.data.market_calendar.is_trading_day",
+                        lambda d: False)
+    # Spy on the run lock — the gate must fire BEFORE the lock is touched.
+    mock_acquire = MagicMock(return_value=True)
+    monkeypatch.setattr("src.execution.paper_trader.acquire_run_lock",
+                        mock_acquire)
+
+    result = daily_run_mod.run_daily(dry_run=True)
+
+    assert result["step"] == 0, "no pipeline step should have run"
+    mock_acquire.assert_not_called()
+    mocks["update_prices"].assert_not_called()
+    mocks["build_portfolio"].assert_not_called()
+    # A closed market is normal, not an error, and not a kill-switch halt.
+    assert result["errors"] == []
+    assert "halted" not in result
+
+
+def test_run_daily_proceeds_on_trading_day(monkeypatch, tmp_path):
+    """Sanity check: with the calendar gate open, the pipeline runs to step 7
+    (the fixture dates are real 2026 trading days, so no patching needed)."""
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
+
+    result = daily_run_mod.run_daily(dry_run=True)
+
+    assert result["step"] == 7
+
+
+# ---------------------------------------------------------------------------
 # Run lock  (#18c)
 # ---------------------------------------------------------------------------
 

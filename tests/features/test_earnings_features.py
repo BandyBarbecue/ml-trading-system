@@ -111,6 +111,81 @@ def test_sue_excluded_on_announcement_day():
     )
 
 
+def _earnings_with_report_time(report_time: str) -> pd.DataFrame:
+    """Copy of the AAPL fixture rows with a report_time column added.
+
+    Only the *latest* report (2023-02-01) gets the flag under test; the
+    older history rows are marked "unknown" — their timing doesn't matter
+    because they're all strictly in the past for the dates we evaluate.
+    """
+    df = EARNINGS[EARNINGS["ticker"] == "AAPL"].copy()
+    df["report_time"] = "unknown"
+    df.loc[df["date"] == pd.Timestamp("2023-02-01"), "report_time"] = report_time
+    return df
+
+
+def test_sue_bmo_counts_on_announcement_day():
+    """A BMO report is public ~7h before day T's close → full-strength day-0 signal."""
+    dates = pd.bdate_range("2023-02-01", "2023-02-03")
+    sue = compute_sue(_earnings_with_report_time("bmo"), dates)
+
+    val_day0 = sue.loc["2023-02-01", "AAPL"]
+    val_day1 = sue.loc["2023-02-02", "AAPL"]
+
+    assert not np.isnan(val_day0), "BMO report must be visible on the announcement day"
+    assert val_day0 > 0
+
+    # Day 0 is full strength (decay factor 1.0); day 1 has decayed by 1/60.
+    # So day0 * (1 - 1/60) should equal day1 exactly.
+    from src.features.earnings_features import DECAY_DAYS
+    assert val_day1 == pytest.approx(val_day0 * (1 - 1 / DECAY_DAYS))
+
+
+def test_sue_amc_excluded_day0_included_day1():
+    """An AMC report lands ~30min after day T's close → visible only from T+1."""
+    dates = pd.bdate_range("2023-02-01", "2023-02-03")
+    sue = compute_sue(_earnings_with_report_time("amc"), dates)
+
+    # Day 0: the report isn't public yet; falling back to the previous report
+    # (2022-11-01, past the 60-day decay window) yields NaN.
+    assert np.isnan(sue.loc["2023-02-01", "AAPL"]), (
+        "AMC report must NOT be visible on the announcement day"
+    )
+
+    # Day 1: visible, decayed by one calendar day (days_since == 1).
+    val_day1 = sue.loc["2023-02-02", "AAPL"]
+    assert not np.isnan(val_day1)
+    assert val_day1 > 0
+
+
+def test_sue_unknown_behaves_like_amc():
+    """When timing is unknown, assume the worst (AMC) — no day-0 inclusion."""
+    dates = pd.bdate_range("2023-02-01", "2023-02-03")
+    sue = compute_sue(_earnings_with_report_time("unknown"), dates)
+
+    assert np.isnan(sue.loc["2023-02-01", "AAPL"])
+    assert not np.isnan(sue.loc["2023-02-02", "AAPL"])
+
+
+def test_sue_legacy_frame_without_report_time_column():
+    """Old parquet files predate report_time — must degrade to conservative, not crash.
+
+    The module-level EARNINGS fixture deliberately has no report_time column,
+    so this exercises the missing-column code path end to end.
+    """
+    assert "report_time" not in EARNINGS.columns  # guard: fixture stays legacy
+
+    dates = pd.bdate_range("2023-02-01", "2023-02-03")
+    sue = compute_sue(EARNINGS, dates)  # must not raise
+
+    # Conservative behaviour == AMC: excluded day 0, included day 1.
+    assert np.isnan(sue.loc["2023-02-01", "AAPL"])
+    assert not np.isnan(sue.loc["2023-02-02", "AAPL"])
+
+    # compute_sue must not have mutated the caller's DataFrame.
+    assert "report_time" not in EARNINGS.columns
+
+
 def test_sue_columns_match_tickers():
     """Output DataFrame columns should exactly match tickers present in input."""
     dates = pd.bdate_range("2023-02-01", "2023-02-10")

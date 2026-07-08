@@ -232,6 +232,17 @@ def run_daily(dry_run: bool = False, force_rebalance: bool = False) -> dict:
         return result
 
     # ------------------------------------------------------------------
+    # NYSE calendar gate — weekends/holidays have nothing to do.  Checked
+    # right after the halt flag and before the run lock, so a Saturday
+    # Task Scheduler misfire doesn't even acquire the lock or touch the
+    # network — it just logs and exits.
+    # ------------------------------------------------------------------
+    from src.data.market_calendar import is_trading_day
+    if not is_trading_day(now.date()):
+        logger.info("Market closed today (weekend/holiday) — nothing to do.")
+        return result
+
+    # ------------------------------------------------------------------
     # Run lock — refuses to start if another run is already in progress
     # (e.g. Task Scheduler firing an overlapping run, or a manual run
     # colliding with the scheduled one). Prevents double-submitted orders.
@@ -621,6 +632,23 @@ def _run_daily_locked(
         logger.error(msg)
         logger.error(traceback.format_exc())
         result["errors"].append(msg)
+
+    # ------------------------------------------------------------------
+    # Optional final step: weekly paper-vs-backtest reconciliation report
+    # (Fridays only, US/Eastern). This compares the real paper equity curve
+    # against a fresh backtest simulation over the same trailing window —
+    # see reconciliation.py's module docstring for why that's the cheapest
+    # overfitting detector available. It is purely a diagnostic: it must
+    # NEVER affect result (no step bump, no error entry) — a broken
+    # reconciliation report should never look like a failed trading day.
+    # ------------------------------------------------------------------
+    if now.weekday() == 4:  # Friday
+        try:
+            from src.execution.reconciliation import build_report
+            build_report()
+            logger.info("Weekly reconciliation report generated.")
+        except Exception as exc:
+            logger.warning("Weekly reconciliation failed (non-fatal): %s", exc)
 
     logger.info(
         "=== Daily run finished: step=%d/7, orders=%d, errors=%d ===",

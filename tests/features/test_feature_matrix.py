@@ -56,7 +56,7 @@ def _isolate_other_feature_sources(tmp_path, monkeypatch) -> None:
     fetch_prices.PRICES_DIR directly rather than config.PRICES_DIR).
     """
     from src.features import earnings_features, price_features
-    from src.data import fetch_news
+    from src.data import fetch_news, sp500_history
 
     # earnings_features binds `EARNINGS_FILE` at import time (`from config
     # import EARNINGS_FILE`), so config.EARNINGS_FILE alone won't redirect
@@ -71,6 +71,11 @@ def _isolate_other_feature_sources(tmp_path, monkeypatch) -> None:
     # price_features binds `PRICES_DIR` at import time; point it at tmp_path,
     # which is where _write_prices() puts the synthetic parquet files.
     monkeypatch.setattr(price_features, "PRICES_DIR", tmp_path)
+    # Point-in-time membership: point CHANGES_FILE at a file that doesn't
+    # exist so build_feature_matrix() falls back to "no masking" even if the
+    # real data/sp500_changes.parquet has been built — these tests use
+    # synthetic tickers (AAA/BBB) that were never real index members.
+    monkeypatch.setattr(sp500_history, "CHANGES_FILE", tmp_path / "no_changes.parquet")
 
 
 def test_target_equals_cross_sectional_rank_of_forward_return(tmp_path, monkeypatch):

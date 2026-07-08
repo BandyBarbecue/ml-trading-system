@@ -124,6 +124,26 @@ def _load_close_price_panel(tickers: list[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Point-in-time universe helper
+# ---------------------------------------------------------------------------
+
+def _members_on_date(membership_mask: pd.DataFrame, day: pd.Timestamp) -> set[str] | None:
+    """Return the set of index members as of `day` from a membership mask.
+
+    The mask rows are trading dates; if `day` is missing from the index we
+    use the most recent row at-or-before `day` ("as-of" lookup) — membership
+    only changes on event dates, so the last known row is still correct.
+    Returns None if `day` predates the whole mask (no information — caller
+    should leave the universe unfiltered rather than filter everything out).
+    """
+    idx = membership_mask.index.get_indexer([day], method="ffill")[0]
+    if idx == -1:
+        return None
+    row = membership_mask.iloc[idx]
+    return set(row.index[row])
+
+
+# ---------------------------------------------------------------------------
 # Metrics helpers
 # ---------------------------------------------------------------------------
 
@@ -187,6 +207,7 @@ def run_backtest(
     log_path: Path | None = None,
     apply_costs: bool = True,
     close_prices: pd.DataFrame | None = None,
+    membership_mask: pd.DataFrame | None = None,
 ) -> dict:
     """Run a walk-forward backtest of the ML pipeline on historical data.
 
@@ -254,6 +275,14 @@ def run_backtest(
         src.features.price_features.load_all_prices() — the same source
         feature_matrix.py uses. Tests inject a synthetic panel here instead
         of touching disk.
+    membership_mask : pd.DataFrame or None
+        Optional point-in-time S&P 500 membership mask (index = date,
+        columns = ticker, values = bool) from
+        src.data.sp500_history.get_membership_mask(). When provided, the
+        candidate universe at each rebalance date is restricted to tickers
+        that were actually index members on that date — fixing the backfill
+        half of survivorship bias (CLAUDE.md rule 7). Default None keeps the
+        previous behaviour (no filtering), so existing callers are unaffected.
 
     Returns
     -------
@@ -375,6 +404,29 @@ def run_backtest(
             # not earn any return until tomorrow's iteration of this loop —
             # today's return (above) already used the OLD held_weights.
             if day.weekday() == config.REBALANCE_WEEKDAY:
+                # ---- Point-in-time universe filter ----
+                # Only tickers that were ACTUAL index members on this date may
+                # compete for a slot. Without this, a stock added to the index
+                # last year could be "picked" in a 2022 rebalance — a form of
+                # look-ahead (we'd be using the fact that it later made the
+                # index). No-op when membership_mask is None.
+                if membership_mask is not None:
+                    members = _members_on_date(membership_mask, day)
+                    if members is not None:
+                        filtered = day_slice[day_slice["ticker"].isin(members)]
+                        if filtered.empty:
+                            # No candidate is a member — keep current holdings
+                            # rather than rebalancing on phantom candidates.
+                            logger.warning(
+                                "No index members among candidates on %s — "
+                                "skipping rebalance.", day.date(),
+                            )
+                            equity_curve[day] = portfolio_value
+                            if portfolio_value > peak_value:
+                                peak_value = portfolio_value
+                            continue
+                        day_slice = filtered
+
                 scores = predict(model, day_slice)
 
                 # Build a prices-proxy from recent target values so HRP has
@@ -531,8 +583,16 @@ def main() -> None:
     tickers = fm["ticker"].unique().tolist()
     sector_map = {t: "Unknown" for t in tickers}
 
+    # Point-in-time membership mask (None + one-time warning if the changes
+    # parquet hasn't been built with `python -m src.data.sp500_history` yet).
+    from src.data.sp500_history import load_membership_mask
+    mask_dates = pd.DatetimeIndex(sorted(pd.to_datetime(fm["date"]).unique()))
+    membership_mask = load_membership_mask(mask_dates, tickers)
+
     print(f"[run_backtest] Running walk-forward backtest …")
-    result = run_backtest(fm, sector_map, apply_costs=apply_costs)
+    result = run_backtest(
+        fm, sector_map, apply_costs=apply_costs, membership_mask=membership_mask
+    )
 
     ec = result["equity_curve"]
     print(f"\n  Period       : {ec.index[0].date()} → {ec.index[-1].date()}")
