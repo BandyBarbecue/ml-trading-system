@@ -509,6 +509,118 @@ def test_run_intraday_stops_at_close(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Wait-until-open  (#21) — a pre-09:30 launch must sleep, not exit with 0 bars
+# ---------------------------------------------------------------------------
+
+def test_seconds_until_open_before_open():
+    """09:25 ET → 300 seconds until the 09:30 bell."""
+    from src.execution.intraday_runner import _seconds_until_open
+
+    assert _seconds_until_open(_et(9, 25)) == pytest.approx(300.0)
+
+
+def test_seconds_until_open_after_open():
+    """10:00 ET → open already passed → zero or negative (no wait)."""
+    from src.execution.intraday_runner import _seconds_until_open
+
+    assert _seconds_until_open(_et(10, 0)) <= 0
+
+
+def _run_intraday_with_wait_stub(monkeypatch, *, wait_secs: float):
+    """Drive run_intraday with _seconds_until_open stubbed to *wait_secs*.
+
+    Returns (sleep_calls, run_bar_calls) so each test asserts one behaviour.
+    The market-hours mock opens the doors for exactly one bar, so the loop
+    always terminates.
+    """
+    import src.execution.intraday_runner as runner_mod
+
+    _fake_now = datetime(2024, 1, 15, 9, 25, 0, tzinfo=_ET)
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: sleep_calls.append(s))
+
+    hours_calls = {"n": 0}
+
+    def fake_market_hours(_now):
+        hours_calls["n"] += 1
+        return hours_calls["n"] <= 1  # one bar, then close
+
+    run_bar_calls: list[int] = []
+
+    def fake_run_bar(bar_idx, held_tickers, news_signals, dry_run=False, is_final_bar=False):
+        run_bar_calls.append(bar_idx)
+        return []
+
+    monkeypatch.setattr(runner_mod, "_is_market_hours", fake_market_hours)
+    monkeypatch.setattr(runner_mod, "run_bar", fake_run_bar)
+    monkeypatch.setattr(runner_mod, "_now_et", lambda: _fake_now)
+    monkeypatch.setattr(runner_mod, "_seconds_until_open", lambda now: wait_secs)
+
+    with (
+        patch("src.execution.paper_trader._make_trading_client", return_value=MagicMock()),
+        patch("src.execution.paper_trader.get_current_positions",
+              return_value=pd.Series(dtype=float)),
+        patch("src.features.nlp_features.extract_signals", return_value=[]),
+        patch("src.execution.intraday_runner._next_bar_time",
+              return_value=datetime(2024, 1, 15, 10, 0, 0, tzinfo=_ET)),
+        patch("src.execution.risk_state.is_halted", return_value=False),
+        patch("src.execution.paper_trader.acquire_run_lock", return_value=True),
+        patch("src.execution.paper_trader.release_run_lock"),
+        patch("src.data.market_calendar.is_trading_day", return_value=True),
+    ):
+        runner_mod.run_intraday(dry_run=True, date="2024-01-15")
+
+    return sleep_calls, run_bar_calls
+
+
+def test_run_intraday_waits_for_open_when_launched_early(monkeypatch):
+    """Launched 5 min before the bell → sleep(300) first, then process bars.
+
+    This is the bug where the 09:25 ET scheduled start fell straight through
+    the market-hours while-loop and exited with 0 bars.
+    """
+    sleep_calls, run_bar_calls = _run_intraday_with_wait_stub(
+        monkeypatch, wait_secs=300.0
+    )
+
+    assert sleep_calls and sleep_calls[0] == pytest.approx(300.0), (
+        f"Expected first sleep to be the 300 s pre-open wait, got {sleep_calls}"
+    )
+    assert run_bar_calls == [0], (
+        f"Expected one bar processed after the wait, got {run_bar_calls}"
+    )
+
+
+def test_run_intraday_no_wait_when_market_already_open(monkeypatch):
+    """Launched after the bell → no pre-open sleep, straight into bar 0."""
+    sleep_calls, run_bar_calls = _run_intraday_with_wait_stub(
+        monkeypatch, wait_secs=-1800.0
+    )
+
+    assert run_bar_calls == [0]
+    # The only sleep allowed is the between-bars one AFTER bar 0 ran —
+    # nothing before it (a pre-open wait would be first and equal -1800/300).
+    assert all(s >= 0 for s in sleep_calls)
+    assert len(sleep_calls) <= 1  # just the post-bar sleep to the next boundary
+
+
+def test_run_intraday_does_not_wait_hours_on_misfire(monkeypatch):
+    """Launched way too early (e.g. a 03:00 misfire) → do NOT sleep for
+    hours holding the run lock; skip the pre-open wait entirely and let the
+    market-hours check decide (in production: false → exit with 0 bars)."""
+    import src.execution.intraday_runner as runner_mod
+
+    sleep_calls, run_bar_calls = _run_intraday_with_wait_stub(
+        monkeypatch, wait_secs=6.5 * 3600
+    )
+
+    assert not any(
+        s > runner_mod._MAX_PREOPEN_WAIT_SECS for s in sleep_calls
+    ), f"Slept past the pre-open cap: {sleep_calls}"
+
+
+# ---------------------------------------------------------------------------
 # Restart-safety guards on run_intraday  (#14 / #18c)
 # ---------------------------------------------------------------------------
 

@@ -46,6 +46,12 @@ _MARKET_OPEN_MINUTE = 30
 # riskier than just falling back to equal-weight, so we don't.
 _TARGET_WEIGHTS_MAX_AGE_DAYS = 7
 
+# The Task Scheduler trigger fires a few minutes before the 09:30 ET bell so
+# the runner is ready for the opening bar. But if the trigger misfires hours
+# early (e.g. the PC wakes at 3 AM), sleeping until open would hold run.lock
+# all night — so we only wait if the open is at most this many seconds away.
+_MAX_PREOPEN_WAIT_SECS = 2 * 60 * 60
+
 
 def _now_et() -> datetime:
     """Return the current datetime in US/Eastern time.
@@ -59,6 +65,19 @@ def _now_et() -> datetime:
 # ---------------------------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------------------------
+
+def _seconds_until_open(now: datetime) -> float:
+    """Seconds from *now* until today's 09:30 ET open.
+
+    Positive → the bell hasn't rung yet; zero or negative → already open
+    (or past). *now* must be an ET datetime (see _now_et).
+    """
+    open_dt = now.replace(
+        hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE,
+        second=0, microsecond=0,
+    )
+    return (open_dt - now).total_seconds()
+
 
 def _effective_close_hm(now: datetime) -> tuple[int, int]:
     """Return (hour, minute) for today's "stop trading" time.
@@ -431,6 +450,21 @@ def run_intraday(dry_run: bool = False, date: str | None = None) -> None:
         return
 
     try:
+        # --- Wait for the opening bell (#21) --------------------------------
+        # The scheduled task starts a few minutes before 09:30 ET. Without
+        # this wait, the while-loop's market-hours check was False on the
+        # very first pass and the runner exited silently with 0 bars — the
+        # intraday layer never ran at all. Waiting here (inside the run
+        # lock) also means an overlapping scheduler fire during the wait
+        # bounces off the lock instead of starting a duplicate runner.
+        wait_secs = _seconds_until_open(_now_et())
+        if 0 < wait_secs <= _MAX_PREOPEN_WAIT_SECS:
+            logger.info(
+                "Market opens in %.0f s — sleeping until the 09:30 ET bell.",
+                wait_secs,
+            )
+            time.sleep(wait_secs)
+
         bar_idx = 0
 
         while _is_market_hours(_now_et()):
