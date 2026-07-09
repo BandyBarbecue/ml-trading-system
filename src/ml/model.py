@@ -27,15 +27,10 @@ FEATURE_COLS = [
 ]
 
 
-#  Below this feature-weight, a feature is treated as "not predictive right now"
-#  and is dropped from training entirely (see the feature_weights handling in
-#  train() for why this replaced the old sample_weight approach).
-FEATURE_WEIGHT_FLOOR = 0.05
-
-
 def train(
     feature_matrix: pd.DataFrame,
     feature_weights: dict[str, float] | None = None,
+    excluded_features: list[str] | None = None,
     params: dict | None = None,
     save: bool = True,
 ) -> lgb.LGBMRegressor:
@@ -48,10 +43,28 @@ def train(
         (float in [0, 1] — the stock's cross-sectional rank on that day).
     feature_weights : dict[str, float] | None
         Optional per-feature IC-derived weights from the IC tracker (see
-        src/ml/ic_tracker.py::get_feature_weights). Used for FEATURE SELECTION:
-        any available feature whose weight is below FEATURE_WEIGHT_FLOOR is
-        dropped from training. Features absent from the dict are treated as
-        "unknown" and kept. If None, all available features are used.
+        src/ml/ic_tracker.py::get_feature_weights), typically already
+        regime-adjusted and renormalised by daily_run.py Step 4. Informational
+        only here — kept on the signature for callers/logging/future use, but
+        train() does NOT use its magnitude to decide which features to drop
+        (see excluded_features below for why that changed).
+    excluded_features : list[str] | None
+        Feature names to drop from training entirely. This is the ONLY thing
+        that decides feature selection now. WHY: the old design dropped a
+        feature when its *normalised weight share* fell below a floor
+        (FEATURE_WEIGHT_FLOOR = 0.05) — but a feature's normalised share
+        depends on how concentrated OTHER features' IC is, not on its own
+        merit (if two features hold 85% of total IC mass, everything else
+        gets squeezed below 5% regardless of whether it's individually
+        predictive). The keep/drop decision now happens exactly ONCE, in
+        daily_run.py Step 4, by comparing each feature's own latest measured
+        IC against config.IC_RETIRE_THRESH (the same space the IC retirement
+        warning already uses) — the resolved list is passed in here so there
+        is a single source of truth for "why was this feature dropped."
+        Features absent from this list are kept, including features absent
+        from feature_weights entirely ("unknown" — e.g. no IC data yet — is
+        not the same as "measured and weak", so they aren't punished).
+        If None (the default), every available feature is used.
     params : dict | None
         Optional LightGBM hyperparameter overrides (e.g. from
         src/ml/tuner.py::load_latest_params()). Any key here overrides the
@@ -74,24 +87,14 @@ def train(
         if c in feature_matrix.columns and feature_matrix[c].notna().any()
     ]
 
-    # feature_weights → feature SELECTION, not per-sample weighting.
-    #
-    # WHY: LightGBM's sklearn API (LGBMRegressor.fit) has no argument for
-    # per-FEATURE weights — only `sample_weight`, which weights entire ROWS.
-    # An earlier version of this function tried to fake per-feature weighting
-    # by setting every row's sample_weight to the SAME constant
-    # (np.full(len(X), weights_array.mean())). Scaling every sample by an
-    # identical constant is a no-op — LightGBM's splits and leaf values are
-    # invariant to a uniform rescale of all weights, so it silently did
-    # nothing. Instead, we use feature_weights honestly: features the IC
-    # tracker has flagged as barely predictive (weight below
-    # FEATURE_WEIGHT_FLOOR) are dropped from the training set entirely, so
-    # the model can't waste tree splits on noise.
-    if feature_weights is not None:
-        avail_features = [
-            c for c in avail_features
-            if feature_weights.get(c, 1.0) >= FEATURE_WEIGHT_FLOOR
-        ]
+    # Feature SELECTION is driven solely by excluded_features now (see the
+    # docstring above for why the old feature_weights-magnitude floor was
+    # removed). LightGBM's sklearn API has no per-FEATURE weight argument
+    # anyway — only `sample_weight`, which weights entire ROWS — so dropping
+    # unwanted columns from X before fit() is the only way to keep the model
+    # from wasting tree splits on features known to be noise right now.
+    if excluded_features:
+        avail_features = [c for c in avail_features if c not in excluded_features]
 
     # Only drop rows where the TARGET is unknown — we can't train without knowing
     # the outcome. Missing FEATURE values are filled with 0 (neutral signal) rather
@@ -104,7 +107,7 @@ def train(
     if X.empty:
         raise ValueError(
             "No training rows remain after dropping rows without a target (or "
-            f"after feature_weights filtering) — available features: {avail_features}"
+            f"after excluded_features filtering) — available features: {avail_features}"
         )
 
     default_params = {

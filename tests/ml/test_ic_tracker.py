@@ -33,6 +33,27 @@ def test_compute_ic_random_is_near_zero():
     assert abs(ic) < 0.2
 
 
+# ---------------------------------------------------------------------------
+# compute_ic None-vs-0.0 contract: "no data" must be distinguishable from a
+# genuinely-measured zero IC (see ic_tracker.py's docstring for the "why").
+# ---------------------------------------------------------------------------
+
+def test_compute_ic_returns_none_for_insufficient_rows():
+    """Fewer than 10 overlapping (feature, target) rows -> None, not 0.0."""
+    x = pd.Series(np.random.randn(5))
+    y = pd.Series(np.random.randn(5))
+    assert compute_ic(x, y) is None
+
+
+def test_compute_ic_returns_none_when_no_overlapping_observations():
+    """The exact bug scenario: a feature and target that share no index
+    (e.g. a feature that has never had a matching target date) must come
+    back as None ('never measured'), not 0.0 ('measured, no relationship')."""
+    x = pd.Series([1.0, 2.0, 3.0], index=[0, 1, 2])
+    y = pd.Series([1.0, 2.0, 3.0], index=[10, 11, 12])
+    assert compute_ic(x, y) is None
+
+
 def test_get_feature_weights_sum_to_one():
     tracker = ICTracker()
     # Manually set IC history
@@ -42,8 +63,41 @@ def test_get_feature_weights_sum_to_one():
         "news_score": [-0.01, 0.00, -0.01],  # near-zero
         "sue": [0.06, 0.05, 0.06],
     }
-    weights = get_feature_weights(tracker)
+    weights, no_data = get_feature_weights(tracker)
     assert abs(sum(weights.values()) - 1.0) < 1e-6
+    assert no_data == []
+
+
+# ---------------------------------------------------------------------------
+# get_feature_weights: features with NO measured (non-None) IC ever must be
+# excluded from the normalisation and reported separately, and the weight
+# basis for the rest must be the latest NON-None entry (skipping trailing
+# no-data months).
+# ---------------------------------------------------------------------------
+
+def test_get_feature_weights_excludes_all_none_history():
+    tracker = ICTracker()
+    tracker._ic_history = {
+        "mom_1m": [0.05, 0.04, 0.06],
+        "news_score": [None, None, None],  # never had overlapping data
+    }
+    weights, no_data = get_feature_weights(tracker)
+    assert "news_score" not in weights
+    assert no_data == ["news_score"]
+    assert abs(sum(weights.values()) - 1.0) < 1e-6
+
+
+def test_get_feature_weights_uses_latest_non_none_ic():
+    """A feature whose most recent month has no data (None) but DOES have
+    older measured months must still be weighted using the latest measured
+    value, not silently dropped."""
+    tracker = ICTracker()
+    tracker._ic_history = {
+        "mom_1m": [0.05, 0.04, None],
+    }
+    weights, no_data = get_feature_weights(tracker)
+    assert "mom_1m" in weights
+    assert no_data == []
 
 
 def test_save_and_load_roundtrip(tmp_path):
@@ -204,3 +258,89 @@ def test_load_or_create_reads_legacy_format(tmp_path):
     tracker = ICTracker.load_or_create(path)
     assert tracker._ic_history == {"mom_1m": [0.05, 0.06], "sue": [0.03]}
     assert tracker._last_update_month == {}
+
+
+def test_load_or_create_reads_legacy_zero_fallback_unchanged():
+    """Legacy files may contain literal 0.0 entries written by the OLD
+    compute_ic fallback (before this fix). No migration: those zeros must
+    load exactly as-is, not be reinterpreted as None."""
+    tracker = ICTracker()
+    tracker._ic_history = {"news_score": [0.0, 0.0, 0.0]}
+    # Sanity: a legacy zero is a real (if uninformative) measured value —
+    # get_recent_ic must return it, not None.
+    assert tracker.get_recent_ic("news_score") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# ICTracker.update() None-handling: a month with no overlapping data (i.e.
+# compute_ic returned None) must be recorded as null/None, never folded into
+# the running mean as if it were a measured 0.0.
+# ---------------------------------------------------------------------------
+
+def test_update_records_none_for_no_data():
+    tracker = ICTracker()
+    tracker.update("news_score", None, as_of="2026-07-01")
+    assert tracker._ic_history["news_score"] == [None]
+
+
+def test_update_none_does_not_corrupt_running_mean_same_month():
+    """A no-data day in the middle of a month with real data must not drag
+    the running mean toward 0.0 — it should simply be skipped."""
+    tracker = ICTracker()
+    tracker.update("mom_1m", 0.05, as_of="2026-07-01")
+    tracker.update("mom_1m", None, as_of="2026-07-15")
+    assert tracker._ic_history["mom_1m"] == [0.05]
+
+
+def test_update_first_real_value_after_none_in_same_month():
+    """No-data days early in the month, followed by a real measurement later
+    in the SAME month, must set the value (not blend with a phantom 0.0)."""
+    tracker = ICTracker()
+    tracker.update("mom_1m", None, as_of="2026-07-01")
+    tracker.update("mom_1m", 0.05, as_of="2026-07-15")
+    assert tracker._ic_history["mom_1m"] == [0.05]
+
+
+def test_update_none_new_month_appends_none():
+    tracker = ICTracker()
+    tracker.update("news_score", 0.05, as_of="2026-06-30")
+    tracker.update("news_score", None, as_of="2026-07-01")
+    assert tracker._ic_history["news_score"] == [0.05, None]
+
+
+def test_save_load_roundtrip_preserves_none(tmp_path):
+    """JSON null <-> Python None must survive a save/load cycle unchanged —
+    daily_run.py reloads the tracker from disk every morning."""
+    tracker = ICTracker()
+    tracker.update("news_score", None, as_of="2026-07-01")
+    tracker.update("mom_1m", 0.05, as_of="2026-07-01")
+    path = tmp_path / "ic_tracker.json"
+    tracker.save(path)
+
+    loaded = ICTracker.load_or_create(path)
+    assert loaded._ic_history["news_score"] == [None]
+    assert loaded._ic_history["mom_1m"] == [0.05]
+
+
+# ---------------------------------------------------------------------------
+# get_recent_ic: must skip None ("no data") entries and return the latest
+# genuinely MEASURED value, or None if nothing has ever been measured.
+# ---------------------------------------------------------------------------
+
+def test_get_recent_ic_skips_trailing_none():
+    tracker = ICTracker()
+    tracker._ic_history = {"mom_1m": [0.05, 0.08, None]}
+    assert tracker.get_recent_ic("mom_1m") == pytest.approx(0.08)
+
+
+def test_get_recent_ic_returns_none_when_never_measured():
+    tracker = ICTracker()
+    tracker._ic_history = {"news_score": [None, None]}
+    assert tracker.get_recent_ic("news_score") is None
+
+
+def test_get_recent_ic_returns_none_for_unknown_feature():
+    """No history at all (feature never updated) -> None, matching the
+    'never measured' contract rather than the old 0.0 default."""
+    tracker = ICTracker()
+    assert tracker.get_recent_ic("brand_new_feature") is None

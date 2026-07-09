@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import pytest
 from src.ml import model as model_module
-from src.ml.model import train, predict, walk_forward_backtest, FEATURE_WEIGHT_FLOOR
+from src.ml.model import train, predict, walk_forward_backtest
 
 
 def make_feature_matrix(n_dates=300, n_tickers=50, seed=42) -> pd.DataFrame:
@@ -145,36 +145,57 @@ def test_train_without_params_keeps_defaults(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Task 11c: feature_weights now performs feature SELECTION (drop features
-# below FEATURE_WEIGHT_FLOOR), not a no-op constant sample_weight.
+# Task 11c (superseded) / weight-floor fix: feature DROP decisions are now
+# made exactly ONCE, upstream in daily_run.py Step 4 (comparing each
+# feature's latest measured IC against config.IC_RETIRE_THRESH — see that
+# module). train() no longer re-derives a drop decision from feature_weights
+# via a share-of-normalised-weight floor (the old FEATURE_WEIGHT_FLOOR =
+# 0.05): that floor operated in the wrong space — a feature's normalised
+# share depends on how concentrated OTHER features' IC is, not on its own
+# merit. Instead, the caller passes the already-resolved exclusion list via
+# `excluded_features`, and train() just executes it mechanically.
 # ---------------------------------------------------------------------------
 
-def test_train_drops_low_weight_features(tmp_path, monkeypatch):
+def test_train_excludes_features_named_in_excluded_features(tmp_path, monkeypatch):
+    """New single-decision-point contract: train() drops exactly the
+    features named in `excluded_features`, nothing more, nothing less."""
     import config
     monkeypatch.setattr(config, "MODELS_DIR", tmp_path)
     fm = make_feature_matrix(n_dates=60, n_tickers=10)
 
-    feature_weights = {
-        "mom_1m": 0.9,                        # well above the floor — kept
-        "sue": FEATURE_WEIGHT_FLOOR - 0.01,   # below the floor — dropped
-    }
-    model = train(fm, feature_weights=feature_weights, save=False)
+    model = train(fm, excluded_features=["sue"], save=False)
 
     assert "sue" not in model.feature_name_
     assert "mom_1m" in model.feature_name_
-    # Features absent from feature_weights are "unknown", not zero-weight —
-    # they must be kept.
+    # Features not named in excluded_features are kept, whether or not they
+    # appear in feature_weights.
     assert "mom_3m" in model.feature_name_
 
 
-def test_train_feature_weights_none_keeps_all_available_features(tmp_path, monkeypatch):
-    """Baseline: with feature_weights=None every available feature is used —
-    confirms the drop behaviour above is specific to the weights, not a
-    general regression."""
+def test_train_feature_weights_magnitude_no_longer_drives_selection(tmp_path, monkeypatch):
+    """Regression guard for the old bug: a tiny feature_weights value must
+    NOT drop a feature by itself now — only excluded_features can. This pins
+    the fix (the drop decision moved to daily_run.py, in raw-IC space)."""
     import config
     monkeypatch.setattr(config, "MODELS_DIR", tmp_path)
     fm = make_feature_matrix(n_dates=60, n_tickers=10)
 
-    model = train(fm, feature_weights=None, save=False)
+    # Under the old FEATURE_WEIGHT_FLOOR (0.05) contract this tiny weight
+    # would have caused "sue" to be dropped. It must now be kept.
+    model = train(fm, feature_weights={"sue": 1e-6, "mom_1m": 0.9}, save=False)
+
+    assert "sue" in model.feature_name_
+    assert "mom_1m" in model.feature_name_
+
+
+def test_train_excluded_features_none_keeps_all_available_features(tmp_path, monkeypatch):
+    """Baseline: with excluded_features=None (the default) every available
+    feature is used — confirms the drop behaviour above is specific to
+    excluded_features, not a general regression."""
+    import config
+    monkeypatch.setattr(config, "MODELS_DIR", tmp_path)
+    fm = make_feature_matrix(n_dates=60, n_tickers=10)
+
+    model = train(fm, feature_weights=None, excluded_features=None, save=False)
     assert "sue" in model.feature_name_
     assert "mom_1m" in model.feature_name_

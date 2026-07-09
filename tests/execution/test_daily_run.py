@@ -30,6 +30,14 @@ import config
 # helper works correctly even when the module is already cached.
 import src.execution.daily_run as daily_run_mod
 
+# Captured at test-module import time, BEFORE any per-test monkeypatching —
+# _patch_all_steps() replaces src.ml.ic_tracker.ICTracker and
+# .get_feature_weights with mocks, so importing them fresh *inside* a test
+# (after that patch has already run) would just hand back the mocks, not the
+# real class/function.
+from src.ml.ic_tracker import ICTracker as _RealICTracker
+from src.ml.ic_tracker import get_feature_weights as _real_get_feature_weights
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -105,7 +113,9 @@ def _patch_all_steps(monkeypatch, tmp_path, *, monday=True, first_of_month=False
     mock_get_sector_map = MagicMock(return_value={"AAPL": "Tech", "MSFT": "Tech"})
     mock_ic_tracker     = MagicMock()  # ICTracker instance
     mock_ic_tracker_cls = MagicMock(return_value=mock_ic_tracker)
-    mock_get_fw         = MagicMock(return_value={})
+    # get_feature_weights now returns (weights, no_data_features) — see
+    # src/ml/ic_tracker.py::get_feature_weights.
+    mock_get_fw         = MagicMock(return_value=({}, []))
 
     monkeypatch.setattr("src.features.feature_matrix.build_feature_matrix",
                         mock_feature_matrix)
@@ -517,3 +527,131 @@ def test_run_daily_releases_lock_after_completion(monkeypatch, tmp_path):
     daily_run_mod.run_daily(dry_run=True)
 
     assert not (tmp_path / "run.lock").exists()
+
+
+# ---------------------------------------------------------------------------
+# Step 4 weight-floor fix: the keep/weak-drop/no-data-yet decision must be
+# made exactly once, here in Step 4, using each feature's own latest
+# measured IC vs config.IC_RETIRE_THRESH — NOT a share-of-normalised-weight
+# floor (the old bug). These tests wire a REAL ICTracker + REAL
+# get_feature_weights (only model.train/predict and the data-fetch layer
+# stay mocked) so the actual daily_run.py decision logic is exercised.
+# ---------------------------------------------------------------------------
+
+def _install_real_tracker(monkeypatch, ic_history: dict):
+    """Swap the generic mocked ICTracker/get_feature_weights (installed by
+    _patch_all_steps) for the REAL get_feature_weights function operating on
+    a real ICTracker pre-loaded with `ic_history`. Returns the tracker so
+    tests can inspect it further if needed."""
+    real_tracker = _RealICTracker()
+    real_tracker._ic_history = ic_history
+
+    class _FakeICTrackerCls:
+        """Stand-in for the ICTracker class — daily_run.py only ever calls
+        the classmethod-style ICTracker.load_or_create(), never ICTracker()
+        directly, so only that entry point needs to be faked."""
+        @staticmethod
+        def load_or_create():
+            return real_tracker
+
+    monkeypatch.setattr("src.ml.ic_tracker.ICTracker", _FakeICTrackerCls)
+    monkeypatch.setattr("src.ml.ic_tracker.get_feature_weights", _real_get_feature_weights)
+
+    # SAFETY: with a REAL (non-mocked) ICTracker, Step 3 calls tracker.save()
+    # for real. ICTracker.save() defaults to config.FEATURES_DIR/"ic_tracker.json"
+    # — but config.FEATURES_DIR was computed once at config.py import time as
+    # DATA_DIR/"features" and is NOT re-derived from config.DATA_DIR later, so
+    # _patch_all_steps's monkeypatch of config.DATA_DIR alone does not
+    # redirect it. Without this, this test would silently overwrite the
+    # project's live data/features/ic_tracker.json. Point it at a throwaway
+    # path explicitly.
+    tmp_features_dir = config.DATA_DIR / "features"
+    monkeypatch.setattr(config, "FEATURES_DIR", tmp_features_dir)
+
+    return real_tracker
+
+
+def test_step4_resolves_keep_drop_from_real_tracker(monkeypatch, tmp_path):
+    """Proves the keep/drop decision lives in daily_run.py, not model.py:
+    a weak-IC feature is excluded, a strong one is kept and weighted, and a
+    never-measured feature is neither excluded nor weighted (kept unweighted)."""
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True, first_of_month=True)
+    _install_real_tracker(monkeypatch, {
+        "mom_1m":     [0.005],   # |IC| < IC_RETIRE_THRESH (0.01) -> dropped weak
+        "mom_12m":    [0.13],    # strong -> kept
+        "news_score": [None],    # never measured -> excluded from weighting, NOT dropped
+    })
+
+    daily_run_mod.run_daily(dry_run=True)
+
+    _, train_kwargs = mocks["train"].call_args
+    excluded = train_kwargs["excluded_features"]
+    weights  = train_kwargs["feature_weights"]
+
+    assert excluded == ["mom_1m"]
+    assert "mom_1m" not in weights
+
+    assert "mom_12m" in weights
+    assert weights["mom_12m"] == pytest.approx(1.0)  # only kept feature -> renormalised to 1.0
+
+    assert "news_score" not in excluded
+    assert "news_score" not in weights
+
+
+def test_step4_logs_three_way_classification(monkeypatch, tmp_path, caplog):
+    """The log must distinguish kept / dropped-weak / no-data-yet — a human
+    reading the log needs to tell these apart (point 6 of the fix spec)."""
+    import logging
+    _patch_all_steps(monkeypatch, tmp_path, monday=True, first_of_month=True)
+    _install_real_tracker(monkeypatch, {
+        "mom_1m":     [0.005],
+        "mom_12m":    [0.13],
+        "news_score": [None],
+    })
+
+    with caplog.at_level(logging.INFO, logger="src.execution.daily_run"):
+        daily_run_mod.run_daily(dry_run=True)
+
+    assert "IC-based weight" in caplog.text       # kept
+    assert "weak IC" in caplog.text                # dropped
+    assert "no IC data yet" in caplog.text          # no-data-yet
+    assert "mom_12m" in caplog.text
+    assert "mom_1m" in caplog.text
+    assert "news_score" in caplog.text
+
+
+def test_step4_renormalises_after_regime_multiplier(monkeypatch, tmp_path):
+    """After multiplying kept features' IC weights by regime multipliers,
+    the combined weights passed to train() must be renormalised back to sum
+    to 1 — the regime multiplier should reshape emphasis, not shrink mass."""
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True, first_of_month=True)
+    _install_real_tracker(monkeypatch, {
+        "mom_1m":  [0.05],
+        "mom_12m": [0.05],
+    })
+    # Force a non-trivial regime multiplier so post-multiply weights would
+    # NOT sum to 1 without renormalisation.
+    monkeypatch.setattr(
+        "src.ml.regime_classifier.get_regime_feature_weights",
+        lambda regime: {"mom_12m": 2.0},
+    )
+    monkeypatch.setattr(
+        "src.ml.regime_classifier.classify_regime",
+        lambda macro_df: "bull_trending",
+    )
+    # Make the regime-classification try-block in Step 3 actually run by
+    # giving it a macro.parquet to find.
+    import pandas as pd
+    macro_dir = tmp_path / "macro"
+    macro_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"date": ["2026-06-01"], "t10y2y": [0.1],
+                  "unrate": [4.0], "fedfunds": [5.0]}).to_parquet(macro_dir / "macro.parquet")
+
+    daily_run_mod.run_daily(dry_run=True)
+
+    _, train_kwargs = mocks["train"].call_args
+    weights = train_kwargs["feature_weights"]
+    assert sum(weights.values()) == pytest.approx(1.0)
+    # mom_12m had the 2x regime multiplier -> should end up weighted more
+    # heavily than mom_1m despite identical raw IC.
+    assert weights["mom_12m"] > weights["mom_1m"]

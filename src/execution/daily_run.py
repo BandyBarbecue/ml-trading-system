@@ -397,7 +397,7 @@ def _run_daily_locked(
     # Step 4: ML inference (or retrain on the 1st of the month)
     # ------------------------------------------------------------------
     try:
-        from src.ml.model  import predict, train, load_latest_model, FEATURE_WEIGHT_FLOOR
+        from src.ml.model  import predict, train, load_latest_model
         from src.ml.tuner  import load_latest_params
 
         existing_model = load_latest_model()
@@ -405,27 +405,81 @@ def _run_daily_locked(
         if (is_first_month or existing_model is None) and not feature_matrix.empty:
             reason = "1st of month — retraining" if existing_model else "no saved model — training initial"
             logger.info("Step 4: %s.", reason)
-            # Combine IC-based weights with regime modulation
-            feature_weights = get_feature_weights(tracker) if tracker else {}
-            combined_weights: dict[str, float] = {
-                k: feature_weights.get(k, 1.0) * regime_feature_weights.get(k, 1.0)
-                for k in set(feature_weights) | set(regime_feature_weights)
-            } if (feature_weights or regime_feature_weights) else {}
 
-            # Log which features model.train() will drop for being below the
-            # feature-selection floor, so a human reading the log can see why
-            # the model's feature set shrank without having to dig into
-            # model.py's internals.
-            dropped = [k for k, v in combined_weights.items() if v < FEATURE_WEIGHT_FLOOR]
-            if dropped:
+            # ------------------------------------------------------------
+            # Single source of truth for the keep/drop decision.
+            #
+            # get_feature_weights() only covers features that have at least
+            # one MEASURED (non-None) monthly IC — it hands back the rest as
+            # no_data_features separately (see ic_tracker.py). This is what
+            # lets us tell "never measured yet" (news_score before enough
+            # overlapping data exists) apart from "measured and weak".
+            # ------------------------------------------------------------
+            ic_weights, no_data_features = get_feature_weights(tracker) if tracker else ({}, [])
+
+            kept_ic_weights: dict[str, float] = {}
+            dropped_weak: list[tuple[str, float]] = []
+            for name, weight in ic_weights.items():
+                latest_ic = tracker.get_recent_ic(name)
+                # WHY compare the RAW latest IC (not the normalised share) to
+                # IC_RETIRE_THRESH: a feature's normalised share depends on
+                # how concentrated OTHER features' IC is, not on its own
+                # merit — that concentration-dependence was exactly the bug
+                # (mom_12m + vol_20d holding ~85% of IC mass squeezed every
+                # other feature under the old 0.05 SHARE floor regardless of
+                # whether it was individually predictive). Comparing raw IC
+                # puts the decision in the same space the IC retirement
+                # warning already uses (get_retirement_warnings), so "this
+                # feature is flagged as decaying" and "this feature got
+                # dropped from training" are judged the same way.
+                if latest_ic is not None and abs(latest_ic) < config.IC_RETIRE_THRESH:
+                    dropped_weak.append((name, latest_ic))
+                else:
+                    kept_ic_weights[name] = weight
+
+            # Regime modulation applies only to the SURVIVING (kept)
+            # features, then we renormalise back to sum-to-1 — otherwise a
+            # regime that down-weights several kept features (multiplier
+            # < 1.0) would shrink the total weight mass the model/log sees,
+            # instead of just reshaping relative emphasis among what's kept.
+            regime_adjusted = {
+                k: kept_ic_weights[k] * regime_feature_weights.get(k, 1.0)
+                for k in kept_ic_weights
+            }
+            total = sum(regime_adjusted.values())
+            combined_weights = (
+                {k: v / total for k, v in regime_adjusted.items()} if total > 0 else {}
+            )
+
+            # ------------------------------------------------------------
+            # Logging: three cases, kept distinct so a human reading the log
+            # doesn't have to guess why a feature's set shrank.
+            # ------------------------------------------------------------
+            if combined_weights:
                 logger.info(
-                    "Step 4: dropping %d feature(s) below weight floor (%.2f): %s",
-                    len(dropped), FEATURE_WEIGHT_FLOOR, dropped,
+                    "Step 4: keeping %d feature(s) with IC-based weight: %s",
+                    len(combined_weights),
+                    {k: round(v, 4) for k, v in
+                     sorted(combined_weights.items(), key=lambda kv: -kv[1])},
                 )
+            if dropped_weak:
+                logger.info(
+                    "Step 4: dropping %d feature(s) for weak IC (|IC| < %.2f): %s",
+                    len(dropped_weak), config.IC_RETIRE_THRESH,
+                    {k: round(v, 4) for k, v in dropped_weak},
+                )
+            if no_data_features:
+                logger.info(
+                    "Step 4: %d feature(s) have no IC data yet (kept, unweighted): %s",
+                    len(no_data_features), sorted(no_data_features),
+                )
+
+            excluded_features = [name for name, _ in dropped_weak]
 
             model = train(
                 feature_matrix,
                 feature_weights=combined_weights if combined_weights else None,
+                excluded_features=excluded_features if excluded_features else None,
                 params=load_latest_params(),
                 save=True,
             )

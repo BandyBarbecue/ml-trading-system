@@ -39,7 +39,7 @@ def compute_ic(
     forward_returns: pd.Series,
     dates: pd.Series | None = None,
     window: int | None = IC_WINDOW,
-) -> float:
+) -> float | None:
     """Spearman rank correlation between a feature and future returns.
 
     IC = Information Coefficient.  A feature with |IC| > 0.05 is considered
@@ -64,9 +64,23 @@ def compute_ic(
                           existed (backward compatible).
 
     Returns:
-        Spearman correlation coefficient in [-1, 1].
-        Returns 0.0 if there are fewer than 10 overlapping observations
-        or if the result is NaN (e.g. zero-variance input).
+        Spearman correlation coefficient in [-1, 1], or None if IC could not
+        be measured at all (fewer than 10 overlapping observations, or a
+        degenerate/NaN result e.g. zero-variance input).
+
+        WHY None and not 0.0: 0.0 is a real, meaningful measurement — "this
+        feature genuinely has no relationship with returns right now". None
+        means "we don't know" — e.g. a brand-new feature (news_score before
+        any news exists for these tickers) that simply has no overlapping
+        data yet. Collapsing both cases to 0.0 (the old behaviour) made a
+        feature that has literally never been measured look identical to one
+        that was measured and found useless — callers (get_feature_weights,
+        the weight floor / drop logic in daily_run.py) could not tell "no
+        signal" apart from "no evidence", and silently downweighted or
+        dropped features that had simply never had a chance to prove
+        themselves. Analogy: a student who was ABSENT for an exam should not
+        be recorded as having scored 0 — "no grade yet" and "failed" call for
+        different responses.
     """
     # Align on the shared index and drop rows where either series is NaN.
     # This handles cases where not all stocks have both a feature value and a return.
@@ -86,11 +100,15 @@ def compute_ic(
         combined = combined[aligned_dates.isin(set(recent_cutoff_dates))]
 
     if len(combined) < 10:
-        # Not enough data to compute a meaningful correlation.
+        # Not enough data to compute a meaningful correlation — this is "no
+        # measurement", not "measured zero". See the docstring's None-vs-0.0
+        # explanation above.
         # Analogy: you can't reliably judge a coin's fairness from 3 flips.
-        return 0.0
+        return None
     corr, _ = spearmanr(combined.iloc[:, 0], combined.iloc[:, 1])
-    return float(corr) if not np.isnan(corr) else 0.0
+    # NaN happens when one series has zero variance (e.g. every stock has the
+    # same feature value) — Spearman correlation is undefined there, not zero.
+    return float(corr) if not np.isnan(corr) else None
 
 
 class ICTracker:
@@ -122,10 +140,15 @@ class ICTracker:
     def update(
         self,
         feature_name: str,
-        ic_value: float,
+        ic_value: float | None,
         as_of: "date | str | None" = None,
     ) -> None:
         """Record a new IC observation for a feature — idempotent per calendar month.
+
+        ic_value may be None (see compute_ic's docstring) — this means "no
+        overlapping data today", not "measured zero". A None is stored as a
+        null entry in the history rather than being folded into the running
+        mean, so it can never drag a real measured average toward zero.
 
         IC_RETIRE_MONTHS (see get_retirement_warnings) is defined in *months*,
         not calls. But daily_run.py calls update() once per trading day. If
@@ -141,7 +164,9 @@ class ICTracker:
 
         Args:
             feature_name: Name of the feature (e.g. "mom_1m").
-            ic_value:     The IC measured this period (float in [-1, 1]).
+            ic_value:     The IC measured this period (float in [-1, 1]), or
+                          None if there was no overlapping data to measure it
+                          from (see compute_ic's docstring).
             as_of:        The calendar date this observation belongs to.
                           Accepts a `datetime.date` or an ISO date string
                           ("YYYY-MM-DD"). Defaults to today's real date —
@@ -162,32 +187,63 @@ class ICTracker:
         last_month = self._last_update_month.get(feature_name)
 
         if last_month == month_key and hist:
-            # Same calendar month as the last observation — update the most
-            # recent entry in place with a running mean, rather than treating
-            # today's single value as a whole new "month" of data.
-            n = self._month_obs_count.get(feature_name, 1)
-            hist[-1] = (hist[-1] * n + ic_value) / (n + 1)
-            self._month_obs_count[feature_name] = n + 1
+            # Same calendar month as the last observation.
+            if ic_value is None:
+                # No data today — leave the month's entry exactly as it was.
+                # WHY: folding None into the running mean would require
+                # treating "no data" as some number, and there is no number
+                # that means "no data" other than None itself. A no-data day
+                # simply contributes nothing — it doesn't shift the average
+                # and doesn't count toward the observation count.
+                pass
+            elif hist[-1] is None:
+                # Earlier day(s) this month had no data, but today does —
+                # this IS the first real observation for the month, so SET
+                # (not blend) it, and start the running-mean count at 1.
+                hist[-1] = ic_value
+                self._month_obs_count[feature_name] = 1
+            else:
+                # Update the most recent entry in place with a running mean,
+                # rather than treating today's single value as a whole new
+                # "month" of data.
+                n = self._month_obs_count.get(feature_name, 1)
+                hist[-1] = (hist[-1] * n + ic_value) / (n + 1)
+                self._month_obs_count[feature_name] = n + 1
         else:
             # New calendar month (or first-ever observation): append.
+            # month_obs_count starts at 0 (not 1) when the first entry of the
+            # month is itself a no-data None — there's no measured value yet
+            # to average against.
             hist.append(ic_value)
             self._last_update_month[feature_name] = month_key
-            self._month_obs_count[feature_name] = 1
+            self._month_obs_count[feature_name] = 0 if ic_value is None else 1
 
         # Trim to the rolling window: keep only the most recent entries.
         self._ic_history[feature_name] = hist[-(IC_RETIRE_MONTHS + 1):]
 
-    def get_recent_ic(self, feature_name: str) -> float:
-        """Return the most recent IC for a feature, or 0.0 if no history yet.
+    def get_recent_ic(self, feature_name: str) -> float | None:
+        """Return the most recent MEASURED IC for a feature, skipping any
+        trailing no-data (None) months, or None if it has never been measured.
+
+        WHY skip Nones instead of just returning hist[-1]: a feature can have
+        real history from a few months ago and then hit a no-data month (e.g.
+        a data source outage) — its last known signal is still the best
+        estimate we have, not "unknown again". See compute_ic's docstring for
+        the None-vs-0.0 distinction this preserves.
 
         Args:
             feature_name: Name of the feature.
 
         Returns:
-            Most recent IC float, or 0.0 if this feature has never been updated.
+            Most recent non-None IC float, or None if this feature has no
+            measured history at all (never updated, or every entry so far is
+            a no-data None).
         """
         hist = self._ic_history.get(feature_name, [])
-        return hist[-1] if hist else 0.0
+        for value in reversed(hist):
+            if value is not None:
+                return value
+        return None
 
     def save(self, path: Path | None = None) -> None:
         """Persist IC history to disk as JSON so it survives between daily runs.
@@ -261,35 +317,51 @@ class ICTracker:
         return warnings
 
 
-def get_feature_weights(tracker: ICTracker) -> dict[str, float]:
-    """Return normalised feature weights based on most-recent IC magnitude.
+def get_feature_weights(tracker: ICTracker) -> tuple[dict[str, float], list[str]]:
+    """Return normalised feature weights based on the latest MEASURED IC.
 
-    Features with higher absolute IC get upweighted.  The weights sum to 1.0
-    so they can be passed directly as LightGBM ``feature_weight`` inputs.
+    Features with higher absolute IC get upweighted.  The weights sum to 1.0.
 
     Why absolute IC?
         A feature with IC = -0.08 is just as predictive as IC = +0.08 — the
         model can learn to negate it.  What matters is magnitude, not sign.
 
-    Features with no history are excluded from the weight dict entirely
-    (treating them as unknown rather than zero-weight).
+    Features that have NEVER produced a measured (non-None) IC — e.g.
+    news_score before enough overlapping data exists — are excluded from the
+    weight dict entirely (they have no evidence either way, so they
+    shouldn't be treated as "IC = 0 and therefore worthless"). Those feature
+    names are returned separately in `no_data_features` so callers can
+    distinguish "no evidence yet" from "measured and dropped".
 
     Args:
         tracker: An ICTracker instance with populated _ic_history.
 
     Returns:
-        Dict mapping feature_name → weight (floats summing to 1.0).
-        Returns an empty dict if the tracker has no history at all.
+        A (weights, no_data_features) tuple:
+          weights:          Dict mapping feature_name → weight (floats
+                             summing to 1.0), for every feature with at least
+                             one measured IC. Empty dict if none qualify.
+          no_data_features: List of feature names whose entire history is
+                             None (tracked, but never successfully measured).
     """
     raw: dict[str, float] = {}
-    for name, hist in tracker._ic_history.items():
-        if hist:
-            # Use a floor of 1e-6 so features with IC=0 still get a tiny
-            # non-zero weight instead of being silently dropped.
-            raw[name] = max(abs(hist[-1]), 1e-6)
+    no_data_features: list[str] = []
+    for name in tracker._ic_history:
+        # get_recent_ic already implements "latest non-None entry, else
+        # None" — reuse it so there's one place that defines "latest
+        # measured IC" for a feature.
+        latest = tracker.get_recent_ic(name)
+        if latest is None:
+            no_data_features.append(name)
+        else:
+            # Floor of 1e-6 so a genuinely-measured IC of exactly 0.0 still
+            # gets a tiny non-zero weight instead of vanishing from the dict
+            # (it WAS measured — it just showed no signal right now).
+            raw[name] = max(abs(latest), 1e-6)
 
     if not raw:
-        return {}
+        return {}, no_data_features
 
     total = sum(raw.values())
-    return {k: v / total for k, v in raw.items()}
+    weights = {k: v / total for k, v in raw.items()}
+    return weights, no_data_features
