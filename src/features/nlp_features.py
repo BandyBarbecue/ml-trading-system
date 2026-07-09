@@ -130,7 +130,7 @@ def _format_batch(batch: list[dict]) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def extract_signals(headlines: pd.DataFrame) -> list[dict]:
+def extract_signals(headlines: pd.DataFrame, allow_api: bool = True) -> list[dict]:
     """Send headlines to Claude Haiku and return structured signals.
 
     Processes headlines in batches of NLP_BATCH_SIZE.  Already-seen headlines
@@ -139,6 +139,14 @@ def extract_signals(headlines: pd.DataFrame) -> list[dict]:
     Args:
         headlines: DataFrame with at least a "headline" column (str).
                    Typically also has ticker, published_at, source columns.
+        allow_api: When False, never calls the Claude API — only headlines
+                   already present in the on-disk cache are returned;
+                   anything uncached is silently dropped (same as if it were
+                   never found). This is used by compute_news_features() for
+                   OLD historical headlines, so that widening the matrix
+                   build's date window can only ever surface signals Claude
+                   already scored on some earlier run — it can never trigger
+                   fresh (paid) extraction for stale news.
 
     Returns:
         List of signal dicts, one per headline that was found in the cache
@@ -172,7 +180,9 @@ def extract_signals(headlines: pd.DataFrame) -> list[dict]:
         if _cache_key(h, s) not in cache
     ]
 
-    if uncached_items:
+    # allow_api=False means: serve cache hits only, never touch the network.
+    # Uncached headlines simply produce no signal (they're dropped below).
+    if uncached_items and allow_api:
         # Build the Anthropic client.  The constructor reads ANTHROPIC_API_KEY
         # from the environment automatically (set in .env via python-dotenv).
         # In tests, `patch("src.features.nlp_features.anthropic.Anthropic")` intercepts
@@ -361,7 +371,7 @@ def _aggregate_scores(
     return {"news_score": news_df, "supply_chain_score": sc_df}
 
 
-def compute_news_features(dates: pd.DatetimeIndex) -> pd.DataFrame:
+def compute_news_features(dates: pd.DatetimeIndex, allow_api: bool = True) -> pd.DataFrame:
     """Load recent headlines, extract signals, aggregate and z-score.
 
     This is the top-level entry point called by the feature pipeline.
@@ -369,6 +379,8 @@ def compute_news_features(dates: pd.DatetimeIndex) -> pd.DataFrame:
 
     Args:
         dates: Business-day DatetimeIndex for which to compute features.
+        allow_api: If False, never call Claude for uncached headlines (see
+            extract_signals) — only already-cached signals are used.
 
     Returns:
         Wide DataFrame with MultiIndex columns (feature_name, ticker).
@@ -378,11 +390,18 @@ def compute_news_features(dates: pd.DatetimeIndex) -> pd.DataFrame:
     from src.features.price_features import cross_section_zscore
     from src.data.fetch_news import load_recent_news
 
-    headlines = load_recent_news(days=NLP_DECAY_DAYS)
+    # Span needed: from (earliest date - decay window) through the latest date,
+    # so _aggregate_scores has real headlines available for EVERY date in
+    # `dates`, not just the trailing few days near whenever this function
+    # happens to be called. Anchoring on dates.max() (not date.today()) is
+    # what makes this correct for historical matrix builds — as_of=None
+    # would silently fall back to today and reproduce the exact bug.
+    span_days = (dates.max() - dates.min()).days + NLP_DECAY_DAYS + 1
+    headlines = load_recent_news(days=span_days, as_of=dates.max().date())
     if headlines.empty:
         return pd.DataFrame(index=dates)
 
-    signals = extract_signals(headlines)
+    signals = extract_signals(headlines, allow_api=allow_api)
     if not signals:
         return pd.DataFrame(index=dates)
 

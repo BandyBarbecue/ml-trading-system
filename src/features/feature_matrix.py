@@ -41,6 +41,7 @@ def build_feature_matrix(
     symbols: list[str],
     dates: pd.DatetimeIndex,
     use_pit_universe: bool = True,
+    allow_api: bool = True,
 ) -> pd.DataFrame:
     """Assemble all features into a tidy long-format DataFrame for ML.
 
@@ -63,6 +64,9 @@ def build_feature_matrix(
             S&P 500 member on that date (point-in-time universe — fixes the
             backfill half of survivorship bias, see CLAUDE.md rule 7).
             If the parquet is missing we warn once and proceed unmasked.
+        allow_api: Passed through to compute_news_features. If False, never
+            call Claude for uncached headlines — only already-cached news
+            signals are used (e.g. for a CI-safe / no-API-calls rebuild).
 
     Returns:
         Long-format DataFrame.  Empty DataFrame if no price data is available.
@@ -108,7 +112,7 @@ def build_feature_matrix(
 
     # --- 3. NLP features ---
     # Returns wide DataFrame with MultiIndex columns: (feature_name, ticker).
-    nlp_feats = compute_news_features(dates)
+    nlp_feats = compute_news_features(dates, allow_api=allow_api)
 
     # --- 3b. Fundamental features (with 45-day lag) ---
     fund_feats = compute_fundamental_features(dates, symbols)

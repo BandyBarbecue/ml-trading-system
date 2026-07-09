@@ -128,6 +128,115 @@ def test_null_affected_tickers_does_not_crash():
     assert scores["news_score"].loc["2024-01-02", "AAPL"] > 0
 
 
+def test_extract_signals_allow_api_false_skips_api_for_uncached(tmp_path, monkeypatch):
+    """allow_api=False must NEVER call Claude — an uncached headline is
+    simply dropped from the result instead of being sent to the API. This
+    is the safety valve that lets compute_news_features() widen its date
+    window to cover historical news without ever triggering new (paid)
+    extraction for headlines Claude has never seen."""
+    from src.features import nlp_features
+    monkeypatch.setattr(nlp_features, "CACHE_FILE", tmp_path / "cache.json")
+
+    headlines = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "headline": ["A headline never processed before"],
+        "published_at": pd.to_datetime(["2024-01-02 14:00"]),
+        "source": ["Reuters"],
+    })
+
+    with patch("src.features.nlp_features.anthropic.Anthropic") as MockClient:
+        signals = nlp_features.extract_signals(headlines, allow_api=False)
+
+    MockClient.assert_not_called()
+    assert signals == []
+
+
+def test_extract_signals_allow_api_false_still_returns_cached(tmp_path, monkeypatch):
+    """allow_api=False must still serve already-cached headlines from disk —
+    it only blocks NEW extraction, not the cache lookup itself."""
+    from src.features import nlp_features
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(nlp_features, "CACHE_FILE", cache_path)
+
+    headline_text = "Apple beats Q3 EPS by 9%, raises guidance"
+    cached_signal = {
+        "headline": headline_text,
+        "event_type": "earnings_beat",
+        "primary_ticker": "AAPL",
+        "direction": "bullish",
+        "magnitude": "large",
+        "time_horizon": "1month",
+        "confidence": 0.9,
+        "affected_tickers": [],
+    }
+    # Cache key format matches nlp_features._cache_key: headline + "|" + summary[:200].
+    cache_path.write_text(json.dumps({headline_text + "|": cached_signal}))
+
+    headlines = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "headline": [headline_text],
+        "published_at": pd.to_datetime(["2024-01-02 14:00"]),
+        "source": ["Reuters"],
+    })
+
+    with patch("src.features.nlp_features.anthropic.Anthropic") as MockClient:
+        signals = nlp_features.extract_signals(headlines, allow_api=False)
+
+    MockClient.assert_not_called()
+    assert len(signals) == 1
+    assert signals[0]["primary_ticker"] == "AAPL"
+
+
+def test_compute_news_features_widens_window_and_anchors_as_of(monkeypatch):
+    """compute_news_features must load enough history to cover the full
+    `dates` span (not just NLP_DECAY_DAYS), anchored on dates.max() rather
+    than real-world today. Otherwise, when `dates` spans ~2 years (a full
+    historical matrix build), load_recent_news(days=NLP_DECAY_DAYS) would
+    only ever fetch the last few REAL-calendar-days of headlines, leaving
+    every older date in `dates` with zero headlines to aggregate over."""
+    from src.features import nlp_features
+    from src.data import fetch_news
+
+    dates = pd.bdate_range("2024-01-02", periods=500)  # ~2 years, like a real build
+
+    mock_load = MagicMock(return_value=pd.DataFrame())  # empty -> short-circuits early
+    monkeypatch.setattr(fetch_news, "load_recent_news", mock_load)
+
+    nlp_features.compute_news_features(dates)
+
+    mock_load.assert_called_once()
+    _, kwargs = mock_load.call_args
+    expected_span = (dates.max() - dates.min()).days + nlp_features.NLP_DECAY_DAYS + 1
+    assert kwargs["days"] == expected_span
+    assert kwargs["as_of"] == dates.max().date()
+
+
+def test_compute_news_features_allow_api_propagates(monkeypatch):
+    """allow_api passed into compute_news_features must reach the
+    extract_signals() call unchanged, so callers can force a hard
+    no-API-calls guarantee for a historical/CI-safe rebuild."""
+    from src.features import nlp_features
+    from src.data import fetch_news
+
+    dates = pd.bdate_range("2024-01-02", periods=5)
+    fake_headlines = pd.DataFrame({
+        "ticker": ["AAPL"],
+        "headline": ["Some headline"],
+        "published_at": pd.to_datetime(["2024-01-02 14:00"]),
+        "source": ["Reuters"],
+    })
+    monkeypatch.setattr(fetch_news, "load_recent_news", MagicMock(return_value=fake_headlines))
+
+    mock_extract = MagicMock(return_value=[])
+    monkeypatch.setattr(nlp_features, "extract_signals", mock_extract)
+
+    nlp_features.compute_news_features(dates, allow_api=False)
+
+    mock_extract.assert_called_once()
+    _, kwargs = mock_extract.call_args
+    assert kwargs.get("allow_api") is False
+
+
 def test_cache_prevents_reprocessing(tmp_path, monkeypatch):
     from src.features import nlp_features
     cache_path = tmp_path / "cache.json"

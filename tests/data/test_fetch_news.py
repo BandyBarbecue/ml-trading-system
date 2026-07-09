@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 from unittest.mock import MagicMock, patch
-from datetime import date
+from datetime import date, timedelta
 
 
 def test_update_news_writes_parquet(tmp_path, monkeypatch):
@@ -103,3 +103,61 @@ def test_update_news_multi_ticker_item(tmp_path, monkeypatch):
     # One news item with two tickers → two rows
     assert len(df) == 2
     assert set(df["ticker"].values) == {"AAPL", "MSFT"}
+
+
+def test_load_recent_news_anchors_on_as_of(tmp_path, monkeypatch):
+    """as_of lets load_recent_news load a window ending at a HISTORICAL date
+    instead of real-world today. This is the root fix for the bug where the
+    5-year feature matrix only ever saw news from the last couple of days
+    near whenever the script happened to run: as_of lets the matrix builder
+    say 'load news as if today were this old date', so news_score actually
+    lines up with the historical dates being assembled.
+    """
+    from src.data import fetch_news
+    monkeypatch.setattr(fetch_news, "NEWS_DIR", tmp_path)
+
+    # Inside the as_of window (2024-03-02 minus 1..3 days = Feb29..Mar1).
+    in_window = pd.DataFrame({
+        "ticker": ["AAPL"], "headline": ["In-window headline"],
+        "published_at": [pd.Timestamp("2024-03-01 14:00")],
+        "source": ["Reuters"], "summary": [""],
+    })
+    in_window.to_parquet(tmp_path / "2024-03-01.parquet")
+
+    # Outside the as_of window, but would be "3 days before real today" if
+    # the function ignored as_of and used date.today() instead — a stale
+    # real-world-anchored implementation would miss this test entirely
+    # (since neither file lines up with today), which is exactly the bug.
+    outside_window = pd.DataFrame({
+        "ticker": ["AAPL"], "headline": ["Too-old headline"],
+        "published_at": [pd.Timestamp("2024-01-01 14:00")],
+        "source": ["Reuters"], "summary": [""],
+    })
+    outside_window.to_parquet(tmp_path / "2024-01-01.parquet")
+
+    result = fetch_news.load_recent_news(days=3, as_of=date(2024, 3, 2))
+
+    assert len(result) == 1
+    assert result.iloc[0]["headline"] == "In-window headline"
+
+
+def test_load_recent_news_defaults_to_real_today(tmp_path, monkeypatch):
+    """With as_of=None (the default), behaviour must be unchanged from
+    before this fix — anchored on real-world today. This is required by the
+    intraday runner and daily_run, which genuinely want 'as of right now'.
+    """
+    from src.data import fetch_news
+    monkeypatch.setattr(fetch_news, "NEWS_DIR", tmp_path)
+
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    fresh = pd.DataFrame({
+        "ticker": ["AAPL"], "headline": ["Fresh headline"],
+        "published_at": [pd.Timestamp.now()],
+        "source": ["Reuters"], "summary": [""],
+    })
+    fresh.to_parquet(tmp_path / f"{yesterday}.parquet")
+
+    result = fetch_news.load_recent_news(days=3)
+
+    assert len(result) == 1
+    assert result.iloc[0]["headline"] == "Fresh headline"

@@ -127,15 +127,30 @@ def update_news(
         print(f"News {day}: {len(out_df)} headlines -> {out_path.name}")
 
 
-def load_recent_news(days: int = 3) -> pd.DataFrame:
+def load_recent_news(days: int = 3, as_of: date | None = None) -> pd.DataFrame:
     """Load the last *days* daily news parquet files into one DataFrame.
 
     Useful for building a short feature window without scanning the whole
     news directory.
+
+    Args:
+        days:  How many calendar days back (from the anchor) to look.
+        as_of: Anchor date for "recent". Defaults to None, which means real
+               -world "today" — the original behaviour, still what the
+               intraday runner and daily_run want (they always want news as
+               of right now). Pass an explicit historical date to load the
+               window ending on THAT date instead. This is what lets a
+               5-year historical feature matrix load news relative to the
+               date it's currently assembling, instead of always relative
+               to whatever day the script happens to be run on (the bug:
+               without this, a build run today only ever sees news from the
+               last few days near today, no matter which historical date
+               each row is for).
     """
+    anchor = as_of if as_of is not None else date.today()
     frames = []
     for i in range(days):
-        d = (date.today() - timedelta(days=i + 1)).isoformat()
+        d = (anchor - timedelta(days=i + 1)).isoformat()
         path = NEWS_DIR / f"{d}.parquet"
         if path.exists():
             frames.append(pd.read_parquet(path))

@@ -10,6 +10,8 @@ not random) so the expected cross-sectional rank of the forward return can
 be computed by hand instead of re-deriving pandas' own rank() logic.
 """
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -194,3 +196,23 @@ def test_perturbing_future_prices_changes_only_targets(tmp_path, monkeypatch):
     assert not np.isclose(target_before, target_after), (
         "Perturbing the exact future price used in T's forward return should change the target"
     )
+
+
+def test_allow_api_false_propagates_to_compute_news_features(tmp_path, monkeypatch):
+    """build_feature_matrix(..., allow_api=False) must thread that flag down
+    into compute_news_features, so callers who want a hard guarantee of no
+    Claude API calls during a feature rebuild (e.g. a CI-safe run) get one."""
+    dates, prices = _make_synthetic_prices()
+    _write_prices(tmp_path, prices)
+    _isolate_other_feature_sources(tmp_path, monkeypatch)
+
+    from src.features import nlp_features
+    mock_compute_news = MagicMock(return_value=pd.DataFrame(index=dates))
+    monkeypatch.setattr(nlp_features, "compute_news_features", mock_compute_news)
+
+    fm = build_feature_matrix(["AAA", "BBB"], dates, allow_api=False)
+    assert not fm.empty
+
+    mock_compute_news.assert_called_once()
+    _, kwargs = mock_compute_news.call_args
+    assert kwargs.get("allow_api") is False
