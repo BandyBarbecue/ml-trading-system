@@ -26,9 +26,12 @@ import modal
 # dies before step 1. The pip package ships its own copy of the IANA database
 # that zoneinfo falls back to, which is the most reliable fix.
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install_from_requirements("requirements.txt")
-    .pip_install("tzdata")
+    # 3.14 matches the laptop's interpreter. requirements-modal.txt pins every
+    # dependency to the laptop's exact version -- the loose requirements.txt
+    # resolved pandas 3.0.5 against the local 2.3.3, which would have changed
+    # what the pipeline computes rather than just where it runs.
+    modal.Image.debian_slim(python_version="3.14")
+    .pip_install_from_requirements("requirements-modal.txt")
     .env(
         {
             # Behavioural parity with the laptop. There are 22 naive
@@ -182,6 +185,73 @@ def daily_dry_run():
     return _run(dry_run=True)
 
 
+@app.function(volumes={"/data": volume}, secrets=secrets, timeout=900)
+def parity_check() -> dict:
+    """Prove the container matches the laptop BEFORE spending 2.5h on a dry run.
+
+    Lives in THIS file on purpose. A previous version sat in a separate script
+    that did `from modal_app import image` at module scope; Modal re-imports the
+    entrypoint file inside the container, where modal_app is not on the path
+    (the image ships only `config` and `src`), so every container died with
+    ModuleNotFoundError and the call retried for hours. The entrypoint file is
+    always mounted, so a check defined here needs no extra local source.
+    """
+    import os
+    import sys
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    out = {"python": sys.version.split()[0]}
+
+    for name in [
+        "pandas", "numpy", "pyarrow", "yfinance", "requests", "lightgbm",
+        "sklearn", "scipy", "optuna", "shap", "anthropic", "vectorbt", "lxml",
+    ]:
+        try:
+            out[name] = getattr(__import__(name), "__version__", "(none)")
+        except Exception as exc:
+            out[name] = f"IMPORT FAILED: {type(exc).__name__}: {exc}"
+
+    # tzdata is the most likely silent killer: slim Debian ships no IANA db.
+    for tz in ("America/New_York", "US/Eastern", "Europe/London"):
+        try:
+            ZoneInfo(tz)
+            out[f"tz:{tz}"] = "OK"
+        except Exception as exc:
+            out[f"tz:{tz}"] = f"FAILED: {type(exc).__name__}"
+
+    out["TZ_env"] = os.environ.get("TZ", "<unset>")
+    out["naive_now"] = datetime.now().isoformat(timespec="seconds")
+
+    # config wiring: DATA_DIR must point at the Volume and see the real data.
+    try:
+        import config
+        out["DATA_DIR"] = str(config.DATA_DIR)
+        out["END_DATE"] = str(config.END_DATE)
+        out["prices_on_volume"] = len(list(config.PRICES_DIR.glob("*")))
+        out["tickers_file"] = (config.DATA_DIR / "sp500_tickers.csv").exists()
+        out["equity_curve"] = (config.DATA_DIR / "equity_curve.parquet").exists()
+    except Exception as exc:
+        out["config"] = f"FAILED: {type(exc).__name__}: {exc}"
+
+    # Import the heavy modules so any 3.14 / pandas incompatibility surfaces
+    # in two minutes rather than two and a half hours.
+    for mod in (
+        "src.execution.daily_run",
+        "src.features.feature_matrix",
+        "src.data.fetch_prices",
+        "src.execution.paper_trader",
+        "src.ml.regime_classifier",
+    ):
+        try:
+            __import__(mod)
+            out[mod] = "import OK"
+        except Exception as exc:
+            out[mod] = f"FAILED: {type(exc).__name__}: {exc}"
+
+    return out
+
+
 @app.function(volumes={"/data": volume}, timeout=600)
 def inspect():
     """Confirm the Volume actually contains what we uploaded."""
@@ -200,6 +270,22 @@ def inspect():
         out[f] = (config.DATA_DIR / f).exists()
     out["DATA_DIR"] = str(config.DATA_DIR)
     return out
+
+
+@app.local_entrypoint()
+def check():
+    """`modal run modal_app.py::check` -> print the parity report.
+
+    A local entrypoint is needed to SEE the result: `modal run` on a plain
+    app.function executes it but does not echo its return value.
+    """
+    out = parity_check.remote()
+    print("\n" + "=" * 66)
+    print("CONTAINER PARITY CHECK")
+    print("=" * 66)
+    for k, v in out.items():
+        print(f"{k:>28} : {v}")
+    print("=" * 66)
 
 
 @app.local_entrypoint()
