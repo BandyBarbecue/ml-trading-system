@@ -7,7 +7,9 @@ import os
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).parent
-DATA_DIR      = PROJECT_ROOT / "data"
+# Overridable so the same code can run against a mounted cloud volume. Unset
+# locally, so this is PROJECT_ROOT / "data" exactly as before.
+DATA_DIR      = Path(os.getenv("TRADING_DATA_DIR", PROJECT_ROOT / "data"))
 
 # --- Data directories ---
 PRICES_DIR    = DATA_DIR / "prices"      # one parquet per symbol
@@ -79,6 +81,11 @@ CLAUDE_NLP_MODEL    = "claude-haiku-4-5-20251001"
 CLAUDE_REVIEW_MODEL = "claude-sonnet-4-6"
 NLP_BATCH_SIZE      = 20      # headlines per Claude API call
 NLP_DECAY_DAYS      = 3       # recency decay window
+NLP_API_WINDOW_DAYS = 7       # only headlines newer than this (relative to the
+                              # window end) may trigger PAID extraction; older
+                              # uncached headlines are cache-only. Caps the worst
+                              # case if the cache is ever invalidated again: a few
+                              # days of headlines, not 2 years of them.
 
 # --- FMP API ---
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
