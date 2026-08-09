@@ -237,6 +237,168 @@ def test_compute_news_features_allow_api_propagates(monkeypatch):
     assert kwargs.get("allow_api") is False
 
 
+def _mock_message(text: str) -> MagicMock:
+    """Build a fake Anthropic response whose .content[0].text is *text*."""
+    content = MagicMock()
+    content.text = text
+    message = MagicMock()
+    message.content = [content]
+    return message
+
+
+def test_crash_mid_run_keeps_completed_batches(tmp_path, monkeypatch):
+    """The cache must be saved after EVERY batch, not once at the end.
+
+    2026-07-10 incident: the run died at batch ~70 of 145 (credits
+    exhausted) and all 69 completed — and paid-for — batches were lost,
+    because saving only happened after the full loop. A crash mid-run must
+    keep everything extracted so far."""
+    from src.features import nlp_features
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(nlp_features, "CACHE_FILE", cache_path)
+
+    # 25 unique headlines with NLP_BATCH_SIZE=20 → two batches.
+    n = nlp_features.NLP_BATCH_SIZE + 5
+    headlines = pd.DataFrame({
+        "ticker": ["AAPL"] * n,
+        "headline": [f"Unique headline number {i}" for i in range(n)],
+        "published_at": pd.to_datetime(["2024-01-02 14:00"] * n),
+        "source": ["Reuters"] * n,
+    })
+    batch1_response = json.dumps([
+        {
+            "headline": f"Unique headline number {i}",
+            "event_type": "other",
+            "primary_ticker": "AAPL",
+            "direction": "neutral",
+            "magnitude": "small",
+            "time_horizon": "1week",
+            "confidence": 0.5,
+            "affected_tickers": [],
+        }
+        for i in range(nlp_features.NLP_BATCH_SIZE)
+    ])
+
+    with patch("src.features.nlp_features.anthropic.Anthropic") as MockClient:
+        MockClient.return_value.messages.create.side_effect = [
+            _mock_message(batch1_response),
+            RuntimeError("credit balance too low"),  # batch 2 dies
+        ]
+        with pytest.raises(RuntimeError):
+            nlp_features.extract_signals(headlines)
+
+    # Batch 1's results must have survived the batch-2 crash.
+    assert cache_path.exists(), "cache file was never written before the crash"
+    saved = json.loads(cache_path.read_text())
+    assert len(saved) == nlp_features.NLP_BATCH_SIZE
+
+
+def test_no_signal_headlines_cached_and_not_resent(tmp_path, monkeypatch):
+    """A headline Claude deliberately skips (batch parsed OK, but no entry
+    for it) must be cached as a no-signal sentinel: it produces no signal in
+    the result, and — crucially — is never paid for again on later runs."""
+    from src.features import nlp_features
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(nlp_features, "CACHE_FILE", cache_path)
+
+    headlines = pd.DataFrame({
+        "ticker": ["AAPL", "MSFT"],
+        "headline": ["Signal-worthy headline", "Boring headline Claude skips"],
+        "published_at": pd.to_datetime(["2024-01-02 14:00", "2024-01-02 15:00"]),
+        "source": ["Reuters", "Reuters"],
+    })
+    # Claude returns an entry for only ONE of the two items in the batch.
+    response = json.dumps([{
+        "headline": "Signal-worthy headline",
+        "event_type": "other",
+        "primary_ticker": "AAPL",
+        "direction": "bullish",
+        "magnitude": "medium",
+        "time_horizon": "1week",
+        "confidence": 0.8,
+        "affected_tickers": [],
+    }])
+
+    with patch("src.features.nlp_features.anthropic.Anthropic") as MockClient:
+        MockClient.return_value.messages.create.return_value = _mock_message(response)
+        signals_first = nlp_features.extract_signals(headlines)
+        first_calls = MockClient.return_value.messages.create.call_count
+        signals_second = nlp_features.extract_signals(headlines)  # same input again
+        second_calls = MockClient.return_value.messages.create.call_count
+
+    # The skipped headline yields no signal but must not be re-sent.
+    assert len(signals_first) == 1
+    assert signals_first[0]["primary_ticker"] == "AAPL"
+    assert signals_second == signals_first
+    assert second_calls == first_calls, "no-signal headline was re-sent to the API"
+
+
+def test_batch_parse_failure_is_not_cached(tmp_path, monkeypatch):
+    """If a WHOLE batch fails to parse (truncated JSON etc.), that's a
+    transient error — nothing may be cached for it, so the next run retries
+    instead of permanently treating those headlines as no-signal."""
+    from src.features import nlp_features
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(nlp_features, "CACHE_FILE", cache_path)
+
+    with patch("src.features.nlp_features.anthropic.Anthropic") as MockClient:
+        MockClient.return_value.messages.create.return_value = _mock_message(
+            "definitely { not valid json"
+        )
+        nlp_features.extract_signals(SAMPLE_HEADLINES)
+        nlp_features.extract_signals(SAMPLE_HEADLINES)
+        assert MockClient.return_value.messages.create.call_count == 2, (
+            "a parse failure must be retried on the next run, not swallowed"
+        )
+
+    assert json.loads(cache_path.read_text()) == {}
+
+
+def test_api_cutoff_blocks_paid_extraction_of_old_headlines(tmp_path, monkeypatch):
+    """Uncached headlines OLDER than api_cutoff must never reach the API,
+    even with allow_api=True. This is the circuit-breaker that caps the
+    damage of any future cache invalidation at a few days of headlines
+    instead of the whole 2-year window (the 2026-07-10 credits burn)."""
+    from src.features import nlp_features
+    monkeypatch.setattr(nlp_features, "CACHE_FILE", tmp_path / "cache.json")
+
+    headlines = pd.DataFrame({
+        "ticker": ["AAPL", "MSFT"],
+        "headline": ["Ancient uncached headline", "Fresh uncached headline"],
+        "published_at": pd.to_datetime(
+            ["2024-01-02 14:00", "2024-03-01 14:00"]
+        ).tz_localize("UTC"),
+        "source": ["Reuters", "Reuters"],
+    })
+    response = json.dumps([{
+        "headline": "Fresh uncached headline",
+        "event_type": "other",
+        "primary_ticker": "MSFT",
+        "direction": "bullish",
+        "magnitude": "medium",
+        "time_horizon": "1week",
+        "confidence": 0.8,
+        "affected_tickers": [],
+    }])
+
+    with patch("src.features.nlp_features.anthropic.Anthropic") as MockClient:
+        MockClient.return_value.messages.create.return_value = _mock_message(response)
+        signals = nlp_features.extract_signals(
+            headlines,
+            allow_api=True,
+            api_cutoff=pd.Timestamp("2024-02-01", tz="UTC"),
+        )
+        prompt_sent = MockClient.return_value.messages.create.call_args.kwargs[
+            "messages"
+        ][0]["content"]
+
+    # Only the fresh headline was sent; the old one was silently dropped.
+    assert "Fresh uncached headline" in prompt_sent
+    assert "Ancient uncached headline" not in prompt_sent
+    assert len(signals) == 1
+    assert signals[0]["primary_ticker"] == "MSFT"
+
+
 def test_cache_prevents_reprocessing(tmp_path, monkeypatch):
     from src.features import nlp_features
     cache_path = tmp_path / "cache.json"

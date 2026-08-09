@@ -105,6 +105,84 @@ def test_update_news_multi_ticker_item(tmp_path, monkeypatch):
     assert set(df["ticker"].values) == {"AAPL", "MSFT"}
 
 
+def test_update_news_fetch_window_includes_target_day(tmp_path, monkeypatch):
+    """The API's end bound is a midnight-anchored TIMESTAMP, so it must sit
+    one day PAST the target date or the target day's own articles are
+    excluded. This was the 'news is structurally two days stale' bug: with
+    end = yesterday, the newest parquet any run could produce was D-2."""
+    from src.data import fetch_news
+    monkeypatch.setattr(fetch_news, "NEWS_DIR", tmp_path)
+
+    with (
+        patch.object(fetch_news, "_make_client"),
+        patch.object(fetch_news, "_get_news_items", return_value=[]) as mock_get,
+    ):
+        fetch_news.update_news(symbols=["AAPL"], target_date="2024-01-02", lookback_days=7)
+
+    _, _, start, end = mock_get.call_args.args
+    assert start == "2023-12-26"
+    assert end == "2024-01-03", "end bound must be the day AFTER the target date"
+
+
+def test_update_news_merges_into_partial_day_file(tmp_path, monkeypatch):
+    """A file written earlier in the day only holds part of that day's
+    articles. A later fetch must UNION new articles into it — adding what's
+    new, keeping what's already there, no duplicates."""
+    from src.data import fetch_news
+    monkeypatch.setattr(fetch_news, "NEWS_DIR", tmp_path)
+
+    # The morning run already saved one article for Jan 2.
+    ts_morning = pd.Timestamp("2024-01-02 14:30:00", tz="UTC")
+    existing = pd.DataFrame({
+        "ticker": ["AAPL"], "headline": ["Apple beats earnings"],
+        "published_at": [ts_morning], "source": ["Reuters"], "summary": [""],
+    })
+    existing.to_parquet(tmp_path / "2024-01-02.parquet", index=False)
+
+    # The afternoon fetch returns the SAME article plus a new one.
+    mock_news = [
+        MagicMock(
+            symbols=["AAPL"], headline="Apple beats earnings",
+            created_at=ts_morning, source="Reuters", summary="",
+        ),
+        MagicMock(
+            symbols=["MSFT"], headline="Microsoft afternoon story",
+            created_at=pd.Timestamp("2024-01-02 19:00:00", tz="UTC"),
+            source="Bloomberg", summary="",
+        ),
+    ]
+    mock_resp = MagicMock()
+    mock_resp.__iter__ = MagicMock(return_value=iter(mock_news))
+
+    with patch.object(fetch_news, "_make_client") as mock_client_fn:
+        mock_client_fn.return_value.get_news.return_value = mock_resp
+        fetch_news.update_news(symbols=["AAPL", "MSFT"], target_date="2024-01-02")
+
+    df = pd.read_parquet(tmp_path / "2024-01-02.parquet")
+    assert len(df) == 2, f"expected morning row + new afternoon row, got:\n{df}"
+    assert set(df["headline"]) == {"Apple beats earnings", "Microsoft afternoon story"}
+
+
+def test_load_recent_news_includes_anchor_day(tmp_path, monkeypatch):
+    """The window must include the anchor day itself (i=0), not start at
+    anchor-1 — otherwise 'today's news' never contains today and the 8:30 AM
+    run can't see overnight headlines."""
+    from src.data import fetch_news
+    monkeypatch.setattr(fetch_news, "NEWS_DIR", tmp_path)
+
+    anchor_day = pd.DataFrame({
+        "ticker": ["AAPL"], "headline": ["Anchor-day headline"],
+        "published_at": [pd.Timestamp("2024-03-02 08:00", tz="UTC")],
+        "source": ["Reuters"], "summary": [""],
+    })
+    anchor_day.to_parquet(tmp_path / "2024-03-02.parquet")
+
+    result = fetch_news.load_recent_news(days=3, as_of=date(2024, 3, 2))
+
+    assert len(result) == 1
+    assert result.iloc[0]["headline"] == "Anchor-day headline"
+
+
 def test_load_recent_news_anchors_on_as_of(tmp_path, monkeypatch):
     """as_of lets load_recent_news load a window ending at a HISTORICAL date
     instead of real-world today. This is the root fix for the bug where the

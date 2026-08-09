@@ -28,6 +28,7 @@ from config import (
     CLAUDE_NLP_MODEL,
     NLP_BATCH_SIZE,
     NLP_DECAY_DAYS,
+    NLP_API_WINDOW_DAYS,
     FEATURES_DIR,
 )
 
@@ -81,6 +82,17 @@ def _save_cache(cache: dict) -> None:
     CACHE_FILE.write_text(json.dumps(cache))
 
 
+def _cache_key(headline: str, summary: str) -> str:
+    """Cache key = headline + "|" + first 200 chars of summary.
+
+    Including the summary snippet means that if the article body changes
+    (e.g. Alpaca backfills a summary later) we re-extract with the richer
+    context. Module-level (not nested) so the one-off cache migration script
+    and tests can build keys in exactly the same format.
+    """
+    return headline + "|" + summary[:200]
+
+
 # ---------------------------------------------------------------------------
 # Scoring helpers
 # ---------------------------------------------------------------------------
@@ -130,7 +142,11 @@ def _format_batch(batch: list[dict]) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def extract_signals(headlines: pd.DataFrame, allow_api: bool = True) -> list[dict]:
+def extract_signals(
+    headlines: pd.DataFrame,
+    allow_api: bool = True,
+    api_cutoff: pd.Timestamp | None = None,
+) -> list[dict]:
     """Send headlines to Claude Haiku and return structured signals.
 
     Processes headlines in batches of NLP_BATCH_SIZE.  Already-seen headlines
@@ -147,6 +163,15 @@ def extract_signals(headlines: pd.DataFrame, allow_api: bool = True) -> list[dic
                    build's date window can only ever surface signals Claude
                    already scored on some earlier run — it can never trigger
                    fresh (paid) extraction for stale news.
+        api_cutoff: Optional timestamp guard on PAID extraction. Uncached
+                   headlines published BEFORE this moment are treated as
+                   cache-only (dropped, never sent to the API), even when
+                   allow_api=True. This is the circuit-breaker for the
+                   2026-07-10 incident: a cache-key change made ~2 years of
+                   already-paid-for headlines look uncached, and the run
+                   tried to re-extract all of them at once. With a cutoff,
+                   the worst case is a few days of headlines. None disables
+                   the guard (old behaviour).
 
     Returns:
         List of signal dicts, one per headline that was found in the cache
@@ -163,21 +188,38 @@ def extract_signals(headlines: pd.DataFrame, allow_api: bool = True) -> list[dic
     summary_col = headlines["summary"] if "summary" in headlines.columns else pd.Series(
         [""] * len(headlines), index=headlines.index
     )
-    # Deduplicate by headline text; keep the first summary seen for each.
+    pub_col = (
+        headlines["published_at"]
+        if "published_at" in headlines.columns
+        else pd.Series([None] * len(headlines), index=headlines.index)
+    )
+    # Deduplicate by headline text; keep the first summary/timestamp seen for each.
     seen: dict[str, str] = {}
-    for h, s in zip(headlines["headline"], summary_col):
+    pub_times: dict[str, pd.Timestamp | None] = {}
+    for h, s, p in zip(headlines["headline"], summary_col, pub_col):
         if h not in seen:
             seen[h] = s if isinstance(s, str) else ""
+            pub_times[h] = p
 
-    # Cache key = headline + "|" + first 200 chars of summary so that if the
-    # article body changes (e.g. Alpaca backfills a summary) we re-extract.
-    def _cache_key(headline: str, summary: str) -> str:
-        return headline + "|" + summary[:200]
+    def _is_too_old(headline: str) -> bool:
+        """True if this headline predates api_cutoff (so paid extraction is barred)."""
+        if api_cutoff is None:
+            return False
+        pub = pub_times.get(headline)
+        if pub is None:
+            return False  # no timestamp to judge by — treat as fresh
+        pub_ts = pd.Timestamp(pub)
+        # Compare in UTC; parquet timestamps are tz-aware UTC, test fixtures
+        # are sometimes naive — localise defensively, same as _aggregate_scores.
+        if pub_ts.tzinfo is None:
+            pub_ts = pub_ts.tz_localize("UTC")
+        cutoff = api_cutoff if api_cutoff.tzinfo else api_cutoff.tz_localize("UTC")
+        return pub_ts < cutoff
 
     uncached_items = [
         {"headline": h, "summary": s}
         for h, s in seen.items()
-        if _cache_key(h, s) not in cache
+        if _cache_key(h, s) not in cache and not _is_too_old(h)
     ]
 
     # allow_api=False means: serve cache hits only, never touch the network.
@@ -220,26 +262,49 @@ def extract_signals(headlines: pd.DataFrame, allow_api: bool = True) -> list[dic
             except (json.JSONDecodeError, IndexError, AttributeError):
                 parsed = []
 
-            # Store each signal in the cache, keyed by headline + summary snippet.
-            # Match signals back to batch items by position (Claude returns in order).
+            # Match signals back to batch items. Claude is asked to echo the
+            # headline verbatim, so match on that first — it survives Claude
+            # skipping or reordering items. Fall back to position only when
+            # the echoed headline doesn't match anything we sent.
+            by_headline = {item["headline"]: item for item in batch}
             for j, signal in enumerate(parsed):
-                if j < len(batch):
+                if not isinstance(signal, dict):
+                    continue  # malformed element (e.g. a bare string) — skip
+                item = by_headline.get(signal.get("headline", ""))
+                if item is None and j < len(batch):
                     item = batch[j]
-                    key = _cache_key(item["headline"], item["summary"])
-                    if key:
-                        cache[key] = signal
+                if item is None:
+                    continue
+                cache[_cache_key(item["headline"], item["summary"])] = signal
 
-        # Persist the updated cache to disk so the next call can skip these.
-        _save_cache(cache)
+            # Any batch item Claude answered the batch for but returned no
+            # entry on is a deliberate skip — cache a sentinel so we stop
+            # paying to re-send it on every future run. If the WHOLE batch
+            # failed to parse (parsed == []), that's a transient error
+            # (truncated JSON, API hiccup): cache nothing, retry next run.
+            if parsed:
+                for item in batch:
+                    key = _cache_key(item["headline"], item["summary"])
+                    if key not in cache:
+                        cache[key] = {"_no_signal": True}
+
+            # Persist after EVERY batch, not once at the end. Each batch is
+            # paid-for API work — the 2026-07-10 run crashed at batch ~70 of
+            # 145 and lost all 69 completed batches because saving only
+            # happened after the full loop.
+            _save_cache(cache)
 
     # Return signals for all requested headlines that are now in the cache.
     # We preserve the original row order from the input DataFrame.
+    # Sentinel entries ({"_no_signal": true}) mean "already asked Claude,
+    # nothing useful here" — they suppress re-extraction above but must not
+    # leak into the signal list.
     result = []
     for h, s in zip(headlines["headline"], summary_col):
         s_str = s if isinstance(s, str) else ""
-        key = _cache_key(h, s_str)
-        if key in cache:
-            result.append(cache[key])
+        signal = cache.get(_cache_key(h, s_str))
+        if isinstance(signal, dict) and not signal.get("_no_signal"):
+            result.append(signal)
     return result
 
 
@@ -401,7 +466,15 @@ def compute_news_features(dates: pd.DatetimeIndex, allow_api: bool = True) -> pd
     if headlines.empty:
         return pd.DataFrame(index=dates)
 
-    signals = extract_signals(headlines, allow_api=allow_api)
+    # Paid extraction is only allowed for headlines from the last
+    # NLP_API_WINDOW_DAYS of the window being built. Runs happen daily, so
+    # anything older was already extracted (and cached) by an earlier run —
+    # if it LOOKS uncached, something is wrong (e.g. a cache-key change),
+    # and silently re-buying 2 years of extraction is never the right answer.
+    api_cutoff = dates.max() - pd.Timedelta(days=NLP_API_WINDOW_DAYS)
+    if api_cutoff.tzinfo is None:  # bdate_range gives tz-naive dates
+        api_cutoff = api_cutoff.tz_localize("UTC")
+    signals = extract_signals(headlines, allow_api=allow_api, api_cutoff=api_cutoff)
     if not signals:
         return pd.DataFrame(index=dates)
 

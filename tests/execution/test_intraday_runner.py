@@ -649,9 +649,14 @@ def test_run_intraday_halted_skips_loop_entirely(monkeypatch):
     assert called["n"] == 0
 
 
-def test_run_intraday_refuses_to_start_while_lock_held(monkeypatch):
-    """If run.lock is already held, run_intraday must not process any bars."""
+def test_run_intraday_gives_up_when_lock_never_freed(monkeypatch):
+    """If run.lock stays held past the wait deadline, run_intraday must give
+    up without processing any bars. Deadline forced to 0 so the test doesn't
+    actually wait."""
     import src.execution.intraday_runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "_LOCK_WAIT_MAX_SECS", 0)
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: None)
 
     called = {"n": 0}
 
@@ -672,6 +677,38 @@ def test_run_intraday_refuses_to_start_while_lock_held(monkeypatch):
         runner_mod.run_intraday(dry_run=True, date="2024-01-15")
 
     assert called["n"] == 0
+
+
+def test_run_intraday_waits_for_lock_then_proceeds(monkeypatch):
+    """If run.lock is held at startup but freed while waiting (the daily run
+    finishing), run_intraday must retry, acquire the lock, and proceed —
+    NOT exit permanently. This is the 2026-07-10 collision: catch-up fires
+    launched both tasks at once, daily won the lock by 1 second, and the
+    old exit-on-held-lock behaviour killed the whole intraday session."""
+    import src.execution.intraday_runner as runner_mod
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda s: sleep_calls.append(s))
+    # Market closed → the bar loop is skipped; this test only cares that we
+    # get PAST the lock gate instead of returning at it.
+    monkeypatch.setattr(runner_mod, "_is_market_hours", lambda now: False)
+    monkeypatch.setattr(runner_mod, "_seconds_until_open", lambda now: 0.0)
+
+    with (
+        patch("src.execution.risk_state.is_halted", return_value=False),
+        patch("src.data.market_calendar.is_trading_day", return_value=True),
+        # Held on the first two attempts, freed on the third.
+        patch("src.execution.paper_trader.acquire_run_lock",
+              side_effect=[False, False, True]) as mock_acquire,
+        patch("src.execution.paper_trader.release_run_lock") as mock_release,
+    ):
+        runner_mod.run_intraday(dry_run=True, date="2024-01-15")
+
+    assert mock_acquire.call_count == 3
+    # Two retry waits of _LOCK_RETRY_SECS while the lock was held.
+    assert sleep_calls[:2] == [runner_mod._LOCK_RETRY_SECS] * 2
+    # Having acquired the lock, it must be released on the way out.
+    mock_release.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

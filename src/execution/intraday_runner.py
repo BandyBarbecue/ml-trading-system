@@ -52,6 +52,16 @@ _TARGET_WEIGHTS_MAX_AGE_DAYS = 7
 # all night — so we only wait if the open is at most this many seconds away.
 _MAX_PREOPEN_WAIT_SECS = 2 * 60 * 60
 
+# If run.lock is held at startup, wait and retry instead of giving up. This
+# happens when the PC was asleep at both trigger times and Task Scheduler's
+# StartWhenAvailable fires the daily run and this runner at the same moment
+# (2026-07-10: daily grabbed the lock 1 second earlier and the intraday layer
+# never ran all day). The daily run normally finishes in ~6 minutes, longer
+# on retrain days — 45 minutes covers that with room to spare while still
+# giving up on a genuinely wedged lock before the session is worthless.
+_LOCK_RETRY_SECS    = 60
+_LOCK_WAIT_MAX_SECS = 45 * 60
+
 
 def _now_et() -> datetime:
     """Return the current datetime in US/Eastern time.
@@ -442,12 +452,22 @@ def run_intraday(dry_run: bool = False, date: str | None = None) -> None:
         return
 
     # --- Run lock ----------------------------------------------------------
-    if not acquire_run_lock():
-        logger.error(
-            "Another run is already in progress (run.lock held) — exiting "
-            "without running the intraday loop."
+    # Wait-and-retry rather than exit: a held lock at startup almost always
+    # means the daily run is mid-flight (catch-up fires launch both tasks at
+    # the same instant), and it will release the lock in a few minutes.
+    lock_deadline = time.monotonic() + _LOCK_WAIT_MAX_SECS
+    while not acquire_run_lock():
+        if time.monotonic() >= lock_deadline:
+            logger.error(
+                "run.lock still held after waiting %.0f minutes — giving up "
+                "on today's intraday session.", _LOCK_WAIT_MAX_SECS / 60,
+            )
+            return
+        logger.info(
+            "run.lock is held (daily run probably in progress) — retrying "
+            "in %d s.", _LOCK_RETRY_SECS,
         )
-        return
+        time.sleep(_LOCK_RETRY_SECS)
 
     try:
         # --- Wait for the opening bell (#21) --------------------------------

@@ -8,8 +8,10 @@ Run from the project root:
     python -m src.data.fetch_news
 """
 
+import logging
+
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from alpaca.data.historical import NewsClient
 from alpaca.data.requests import NewsRequest
@@ -17,6 +19,11 @@ from alpaca.data.requests import NewsRequest
 # Import the module-level values we need.  NEWS_DIR is also exposed at the top
 # level so tests can monkeypatch it: `monkeypatch.setattr(fetch_news, "NEWS_DIR", ...)`
 from config import NEWS_DIR, ALPACA_API_KEY, ALPACA_SECRET_KEY
+
+# logging (not print) so news fetches show up in data/logs/daily_run_*.log —
+# the 2026-07-10 post-mortem found the news pipeline had been silently stale
+# for days precisely because its output never reached the log files.
+logger = logging.getLogger(__name__)
 
 
 def _make_client() -> NewsClient:
@@ -74,11 +81,16 @@ def update_news(
     if symbols is None:
         symbols = get_symbols()
 
+    # The API's `end` bound is a TIMESTAMP: a bare date string means midnight
+    # at the START of that day, so passing "yesterday" actually excluded all
+    # of yesterday's articles and the newest file was always two days old
+    # (the 2026-07-10 "news is structurally stale" bug). To INCLUDE a day's
+    # articles the bound must be past the end of that day.
     if target_date is not None:
-        end_date   = target_date
+        end_date   = (date.fromisoformat(target_date) + timedelta(days=1)).isoformat()
         start_date = (date.fromisoformat(target_date) - timedelta(days=lookback_days)).isoformat()
     else:
-        end_date   = (date.today() - timedelta(days=1)).isoformat()   # yesterday
+        end_date   = datetime.now(timezone.utc).isoformat()   # right now — includes today so far
         start_date = (date.today() - timedelta(days=lookback_days)).isoformat()
 
     client = _make_client()
@@ -120,11 +132,25 @@ def update_news(
 
     for day, group in df.groupby("date"):
         out_path = NEWS_DIR / f"{day}.parquet"
-        if out_path.exists():
-            continue  # already saved from a previous run — don't overwrite
         out_df = group.drop(columns=["date"])
+        if out_path.exists():
+            # Now that we fetch through "right now", a file written earlier
+            # today (or yesterday intraday) only holds PART of that day's
+            # articles. Merge instead of skip-or-overwrite: union the old and
+            # new rows and drop duplicates, so re-fetching can only ever ADD
+            # articles, never lose ones a previous run already saved (the
+            # fetch is capped at 1000 items, so a wide window can return
+            # fewer old articles than we already have on disk).
+            existing = pd.read_parquet(out_path)
+            merged = pd.concat([existing, out_df], ignore_index=True)
+            # keep="last" prefers the freshly fetched copy of a duplicate row
+            # (it may carry a backfilled summary the old row lacked).
+            merged = merged.drop_duplicates(
+                subset=["ticker", "headline", "published_at"], keep="last"
+            )
+            out_df = merged
         out_df.to_parquet(out_path, index=False)
-        print(f"News {day}: {len(out_df)} headlines -> {out_path.name}")
+        logger.info("News %s: %d headlines -> %s", day, len(out_df), out_path.name)
 
 
 def load_recent_news(days: int = 3, as_of: date | None = None) -> pd.DataFrame:
@@ -149,8 +175,14 @@ def load_recent_news(days: int = 3, as_of: date | None = None) -> pd.DataFrame:
     """
     anchor = as_of if as_of is not None else date.today()
     frames = []
+    # i=0 is the anchor day ITSELF, not the day before. Excluding the anchor
+    # (the old `i + 1`) meant "today's news" never included today: the 8:30 AM
+    # run couldn't see overnight headlines and the intraday event layer read a
+    # file that was never part of the window. Look-ahead safety for historical
+    # builds is handled downstream by _aggregate_scores' 16:00-ET close cutoff,
+    # not by hiding the anchor day's file.
     for i in range(days):
-        d = (anchor - timedelta(days=i + 1)).isoformat()
+        d = (anchor - timedelta(days=i)).isoformat()
         path = NEWS_DIR / f"{d}.parquet"
         if path.exists():
             frames.append(pd.read_parquet(path))
