@@ -46,6 +46,18 @@ image = (
             # one-line config.py change documented in the migration plan.
             "TRADING_DATA_DIR": "/data",
             "PYTHONUNBUFFERED": "1",
+            # Six modules put a literal em-dash in the logging FORMAT string
+            # (daily_run, intraday_runner, feature_matrix, fetch_fundamentals,
+            # fetch_insider, sp500_history), emitted through a StreamHandler
+            # that never sets an encoding. On Windows stderr is cp1252 and
+            # encodes it fine; on Linux it follows the locale, and under a
+            # C/POSIX locale that resolves to ascii and every single log line
+            # raises UnicodeEncodeError. Debian bookworm's glibc ships C.UTF-8
+            # so this currently works -- observed fine in the 2026-08-09 run --
+            # but that is an unguaranteed default propping up the whole log
+            # path, and forcing UTF-8 costs nothing.
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
         }
     )
     # Ships config.py and the src/ package. Non-Python files are excluded by
@@ -252,6 +264,61 @@ def parity_check() -> dict:
     return out
 
 
+@app.function(
+    volumes={"/data": volume},
+    secrets=secrets,
+    timeout=6 * 60 * 60,
+    cpu=2,
+    memory=2048,
+    max_containers=1,
+    single_use_containers=True,
+)
+def validation_dry_run(as_of: str = "2026-08-07") -> dict:
+    """Exercise the FULL pipeline on a chosen trading day. Manual only.
+
+    Why this exists: the first Modal dry run landed on a Sunday, so the NYSE
+    calendar gate returned at step 0/7 and validated nothing beyond the Volume
+    mount. Waiting for the next session would mean deploying an unproven
+    container, so this pins the clock to a real trading day instead.
+
+    run_daily() takes no date argument and reads the clock through
+    daily_run._today(), so that is the single point to override. dry_run is
+    hard-coded True and there is no parameter to change it -- this function
+    cannot submit an order regardless of how it is called. It is deliberately
+    unscheduled: nothing invokes it but a human.
+    """
+    import logging
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    _setup_logging()
+    from src.execution import daily_run as dr
+
+    stamp = datetime.fromisoformat(as_of).replace(
+        hour=8, minute=30, tzinfo=ZoneInfo("America/New_York")
+    )
+    dr._today = lambda: stamp  # noqa: E731 -- see docstring
+
+    try:
+        result = dr.run_daily(dry_run=True)
+    finally:
+        volume.commit()
+
+    logging.getLogger(__name__).info(
+        "Validation run (as_of=%s): step=%s/7 orders=%s errors=%s",
+        as_of, result["step"], len(result["orders"]), len(result["errors"]),
+    )
+    return {
+        "as_of": as_of,
+        "date": result["date"],
+        "step": result["step"],
+        "orders": len(result["orders"]),
+        "errors": result["errors"],
+        "risk_decisions": result["risk_decisions"],
+        "halted": result.get("halted", False),
+    }
+
+
 @app.function(volumes={"/data": volume}, timeout=600)
 def inspect():
     """Confirm the Volume actually contains what we uploaded."""
@@ -290,6 +357,10 @@ def check():
 
 @app.local_entrypoint()
 def main():
-    """`modal run modal_app.py` -> verify the Volume, then dry-run."""
+    """`modal run modal_app.py::main` -> verify the Volume, then dry-run.
+
+    The target must be named explicitly: with more than one local entrypoint
+    defined, a bare `modal run modal_app.py` errors rather than picking one.
+    """
     print("Volume contents:", inspect.remote())
     print("Dry run result:", daily_dry_run.remote())
