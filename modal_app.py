@@ -12,6 +12,9 @@ Test before deploying (runs once, right now, submits nothing):
 
 Watch a scheduled run afterwards:
     modal app logs trading-system
+
+Rebuild the book on a non-Monday (see force_rebalance for why you'd need to):
+    modal run --detach modal_app.py::force_rebalance --no-dry-run
 """
 
 import modal
@@ -101,14 +104,14 @@ def _setup_logging() -> None:
     )
 
 
-def _run(dry_run: bool) -> dict:
+def _run(dry_run: bool, force_rebalance: bool = False) -> dict:
     import logging
 
     _setup_logging()
     from src.execution.daily_run import run_daily
 
     try:
-        result = run_daily(dry_run=dry_run)
+        result = run_daily(dry_run=dry_run, force_rebalance=force_rebalance)
     finally:
         # Flush the Volume even on failure -- a partial run still produced
         # fetched prices, news parquets and a paid-for NLP cache, and losing
@@ -195,6 +198,47 @@ def daily():
 def daily_dry_run():
     """Full pipeline, no orders. Use this to validate the migration."""
     return _run(dry_run=True)
+
+
+@app.function(
+    volumes={"/data": volume},
+    secrets=secrets,
+    timeout=6 * 60 * 60,
+    cpu=2,
+    memory=2048,
+    max_containers=1,
+    retries=0,
+    single_use_containers=True,
+)
+def force_rebalance(dry_run: bool = True) -> dict:
+    """Run the pipeline treating today as Monday, so Steps 5-7 execute.
+
+    Why this exists: portfolio construction is gated on
+    config.REBALANCE_WEEKDAY (Monday), and the risk engine in Step 6 only
+    runs when Step 5 produced weights. So on a Tuesday the scheduled `daily`
+    job stops after Step 4 -- correct on an ordinary Tuesday, but wrong when
+    the book needs rebuilding off-cycle. That happened on 2026-08-10: a
+    kill switch firing on a stale baseline liquidated 22 positions, leaving
+    the account ~100% cash with the next legitimate rebalance five trading
+    days away.
+
+    dry_run defaults to TRUE, unlike `daily`. This function bypasses a
+    deliberate trading-frequency control, so the safe outcome has to be the
+    one you get by forgetting an argument:
+
+        modal run modal_app.py::force_rebalance                  # no orders
+        modal run --detach modal_app.py::force_rebalance --no-dry-run   # trades
+
+    Use --detach for the live one: the run takes ~40 minutes (Step 3 is 96%
+    of it) and a detached run survives the laptop sleeping, which is what
+    silently killed four weeks of scheduled runs before the Modal migration.
+
+    Note the turnover cap still applies. Rebuilding from all-cash is ~50%
+    two-way turnover against a 40% cap, so construction shrinks every delta
+    proportionally and the book lands ~80% invested; the remainder goes in
+    at the next rebalance.
+    """
+    return _run(dry_run=dry_run, force_rebalance=True)
 
 
 @app.function(volumes={"/data": volume}, secrets=secrets, timeout=900)
