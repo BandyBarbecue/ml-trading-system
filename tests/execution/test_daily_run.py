@@ -153,6 +153,13 @@ def _patch_all_steps(monkeypatch, tmp_path, *, monday=True, first_of_month=False
                         lambda symbols, lookback=60: pd.DataFrame())
     monkeypatch.setattr(daily_run_mod, "_get_account_value",
                         lambda: 100_000.0)
+    # Default: no Alpaca last_equity baseline available, so Step 6 falls back
+    # to the local equity-curve row (tests below override this explicitly to
+    # cover the "Alpaca available" path). Without this, the generic MagicMock
+    # client's account.last_equity would auto-convert via float() to 1.0
+    # (MagicMock's default __float__), silently corrupting daily_pnl_pct.
+    monkeypatch.setattr(daily_run_mod, "_get_previous_close_equity",
+                        lambda: None)
 
     # ---- Step 6 mocks ----
     mock_engine_instance = MagicMock()
@@ -318,6 +325,31 @@ def test_live_run_submits_orders(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# test_step7_passes_idempotency_key_prefix_with_run_date
+# ---------------------------------------------------------------------------
+
+def test_step7_passes_idempotency_key_prefix_with_run_date(monkeypatch, tmp_path):
+    """Step 7 must pass idempotency_key_prefix to submit_rebalance, and that
+    prefix must contain the run's own date string (result["date"]) — not a
+    fresh date.today() — so a preemption-restarted run still lands on the
+    same key even when _today() is pinned by validation_dry_run."""
+    mocks = _patch_all_steps(monkeypatch, tmp_path, monday=True)
+
+    result = daily_run_mod.run_daily(dry_run=False)
+
+    mocks["submit_rebalance"].assert_called_once()
+    _, kwargs = mocks["submit_rebalance"].call_args
+    assert "idempotency_key_prefix" in kwargs, (
+        "Step 7 must supply idempotency_key_prefix so a preemption replay "
+        "cannot double-submit orders."
+    )
+    assert result["date"] in kwargs["idempotency_key_prefix"], (
+        "The prefix must be derived from the run's own date string "
+        f"({result['date']!r}), got {kwargs['idempotency_key_prefix']!r}."
+    )
+
+
+# ---------------------------------------------------------------------------
 # test_step_counter_reaches_7
 # ---------------------------------------------------------------------------
 
@@ -459,6 +491,63 @@ def test_no_kill_switch_no_halt_flag(monkeypatch, tmp_path):
     result2 = daily_run_mod.run_daily(dry_run=True)
     assert "halted" not in result2
     assert result2["step"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch baseline precedence (2026-08-10 false-fire fix)
+# ---------------------------------------------------------------------------
+
+def test_kill_switch_prefers_alpaca_last_equity_over_stale_local_curve(monkeypatch, tmp_path):
+    """REGRESSION for 2026-08-10: reproduces the exact real-world shape —
+    a local equity curve with rows only on 2026-07-08 and 2026-07-13 (28
+    days stale relative to "today"), but Alpaca's own last_equity correctly
+    reporting yesterday's close. _get_previous_close_equity must be used
+    (and must win), so the kill switch is evaluated against a true one-day
+    move and does NOT fire."""
+    from src.risk.engine import RiskEngine as RealRiskEngine
+    from src.execution import equity_tracker, risk_state
+
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
+    monkeypatch.setattr("src.risk.engine.RiskEngine", RealRiskEngine)
+
+    # Stale local history — exactly the state that caused the false fire.
+    equity_tracker.update_equity(100_000.0, as_of=date(2026, 7, 8))
+    equity_tracker.update_equity(100_000.0, as_of=date(2026, 7, 13))
+
+    # Alpaca's own last_equity says yesterday's close was 97,940.69 and
+    # today's account value is 97,940.69 * (1 - 0.0062) ~= a true -0.62% day.
+    account_value = 97_940.69
+    monkeypatch.setattr(daily_run_mod, "_get_account_value", lambda: account_value)
+    monkeypatch.setattr(daily_run_mod, "_get_previous_close_equity", lambda: 98_552.31)
+
+    result = daily_run_mod.run_daily(dry_run=True)
+
+    assert not any(d.get("action") == "kill_switch" for d in result["risk_decisions"]), (
+        f"Kill switch must NOT fire on a true -0.62% day, got: {result['risk_decisions']}"
+    )
+    assert risk_state.is_halted("2026-06-08") is False
+
+
+def test_kill_switch_falls_back_to_guarded_local_curve_when_alpaca_unavailable(monkeypatch, tmp_path):
+    """When Alpaca's last_equity is unavailable, fall back to the (now
+    staleness-guarded) local equity curve. A fresh (1-day-old) row must
+    still let the kill switch fire on a genuine loss."""
+    from src.risk.engine import RiskEngine as RealRiskEngine
+    from src.execution import equity_tracker, risk_state
+
+    _patch_all_steps(monkeypatch, tmp_path, monday=True)
+    monkeypatch.setattr("src.risk.engine.RiskEngine", RealRiskEngine)
+
+    equity_tracker.update_equity(100_000.0, as_of=date(2026, 6, 5))
+    monkeypatch.setattr(daily_run_mod, "_get_account_value", lambda: 97_000.0)
+    monkeypatch.setattr(daily_run_mod, "_get_previous_close_equity", lambda: None)
+
+    result = daily_run_mod.run_daily(dry_run=True)
+
+    assert any(d.get("action") == "kill_switch" for d in result["risk_decisions"]), (
+        f"Expected a kill_switch decision, got: {result['risk_decisions']}"
+    )
+    assert risk_state.is_halted("2026-06-08") is True
 
 
 # ---------------------------------------------------------------------------

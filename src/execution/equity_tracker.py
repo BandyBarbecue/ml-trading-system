@@ -131,7 +131,7 @@ def load_equity_curve() -> pd.DataFrame:
     return _read_equity_curve(out_path)
 
 
-def load_previous_equity(before: date | str) -> float | None:
+def load_previous_equity(before: date | str, max_age_days: int | None = 4) -> float | None:
     """Return the most recent recorded equity value strictly BEFORE `before`.
 
     Used by daily_run.py to compute today's real daily P&L for the kill
@@ -139,10 +139,30 @@ def load_previous_equity(before: date | str) -> float | None:
     there is no prior history (e.g. the very first run ever) — the caller
     treats that as "can't compute a daily P&L yet" and uses 0.0.
 
+    Staleness guard (max_age_days)
+    -------------------------------
+    On 2026-08-10 this function returned a row that was 28 calendar days old
+    (our runs had been failing for four weeks), and the caller divided that
+    28-day move as if it were one day's P&L — a -2.06% "day" that was really
+    a month, which tripped the kill switch and liquidated the whole book on
+    a false signal. A single stale row with no context looks identical to a
+    genuine one-day loss, so the guard below rejects it instead.
+
+    The default of 4 calendar days is the largest gap that can occur between
+    two CONSECUTIVE trading days: Friday -> Tuesday, when Monday is a public
+    holiday (Fri, Sat, Sun, Mon = 4 days). Anything wider than that cannot be
+    a legitimate one-day gap — it means OUR OWN history has a hole (a missed
+    run), and the row is not safe to use as a one-day baseline. Pass
+    max_age_days=None to disable the check and get the old raw behaviour
+    (e.g. for callers that already handle staleness themselves).
+
     Parameters
     ----------
-    before : The date to compare against (exclusive) — normally "today"
-             (either a date or a "YYYY-MM-DD" string).
+    before       : The date to compare against (exclusive) — normally "today"
+                   (either a date or a "YYYY-MM-DD" string).
+    max_age_days : Reject the prior row if it is more than this many calendar
+                   days before `before`. Default 4 (see above). None disables
+                   the check entirely.
     """
     curve = load_equity_curve()
     if curve.empty:
@@ -155,4 +175,17 @@ def load_previous_equity(before: date | str) -> float | None:
     prior_rows = curve[curve["date"] < cutoff].sort_values("date")
     if prior_rows.empty:
         return None
+
+    prior_date = prior_rows["date"].iloc[-1]
+    if max_age_days is not None:
+        age_days = (cutoff - prior_date).days
+        if age_days > max_age_days:
+            logger.warning(
+                "load_previous_equity: most recent prior row (%s) is %d calendar "
+                "days before %s (max_age_days=%d) — our history has a gap, so this "
+                "is not a trustworthy one-day baseline. Returning None.",
+                prior_date.date(), age_days, cutoff.date(), max_age_days,
+            )
+            return None
+
     return float(prior_rows["equity"].iloc[-1])

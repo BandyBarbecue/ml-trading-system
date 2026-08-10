@@ -144,6 +144,29 @@ def _get_account_value() -> float:
         return 100_000.0
 
 
+def _get_previous_close_equity() -> float | None:
+    """Get the account's equity as of the PREVIOUS trading day's close, from
+    Alpaca directly (account.last_equity).
+
+    This is the PREFERRED kill-switch baseline: it comes from Alpaca's own
+    books, so it is immune to gaps in our local equity_curve.parquet (e.g. a
+    month of failed runs) — see paper_trader.get_previous_close_equity.
+
+    Unlike _get_account_value(), there is no numeric fallback here on
+    failure. A wrong fallback number (like $100,000) would silently corrupt
+    the kill-switch P&L calc, which is exactly the class of bug we are
+    fixing. Returning None lets the caller fall through to the next-best
+    baseline instead of trusting a guess.
+    """
+    try:
+        from src.execution.paper_trader import _make_trading_client, get_previous_close_equity
+        client = _make_trading_client()
+        return get_previous_close_equity(client)
+    except Exception as exc:
+        logger.warning("Could not fetch previous close equity from Alpaca: %s", exc)
+        return None
+
+
 def _save_target_weights(weights: pd.Series, date_str: str) -> None:
     """Persist Step 5's final HRP-sized weights to data/target_weights.json.
 
@@ -603,16 +626,49 @@ def _run_daily_locked(
             from src.execution.risk_state     import get_peak_value, set_halted
             from src.execution.equity_tracker import update_equity, load_previous_equity
 
-            # Real daily P&L for the kill switch. Previously this was
-            # hardcoded to 0.0, which meant the kill switch (daily_pnl_pct
-            # <= -DAILY_LOSS_LIMIT) could NEVER fire — a flat 0.0% is never
-            # <= a negative threshold. Compute it from yesterday's persisted
-            # equity-curve row instead.
-            daily_pnl_pct = 0.0  # first run ever (no prior equity history) → can't compute a % change yet
+            # Real daily P&L for the kill switch. Two bugs have lived here:
+            #   Bug 1 (fixed earlier): this was hardcoded to 0.0, so the kill
+            #     switch (daily_pnl_pct <= -DAILY_LOSS_LIMIT) could NEVER
+            #     fire — a flat 0.0% is never <= a negative threshold.
+            #   Bug 2 (THIS fix, 2026-08-10): switching to "yesterday's
+            #     persisted equity-curve row" introduced a worse failure —
+            #     our runs had been failing silently for four weeks, so the
+            #     "most recent prior row" was 28 days old (2026-07-13). The
+            #     code divided that 28-day move as if it were one day
+            #     ((97940.69-100000)/100000 = -2.06%), breached the 2% limit,
+            #     and liquidated the entire book on a false signal — the true
+            #     one-day move was only -0.62%.
+            #
+            # Fix: prefer Alpaca's own account.last_equity (via
+            # _get_previous_close_equity), which Alpaca updates once per
+            # trading-day close regardless of whether OUR pipeline ran that
+            # day — it cannot go stale the way our local file can. Fall back
+            # to the local equity-curve row only if Alpaca is unreachable,
+            # and that fallback is now staleness-guarded (equity_tracker.
+            # load_previous_equity rejects any row more than 4 calendar days
+            # old). If both are unavailable, fall back to 0.0 — i.e. disable
+            # the kill switch for this run rather than fire on a guess. This
+            # is the safe direction: the 15% drawdown cap (risk_state.json's
+            # persisted peak_value) still applies independently, so a run
+            # with no trustworthy daily baseline is not left unprotected.
+            daily_pnl_pct = 0.0
+            prev_equity = None
+            source = "none (no trustworthy baseline)"
             try:
-                prev_equity = load_previous_equity(today)
+                prev_equity = _get_previous_close_equity()
+                source = "alpaca.last_equity"
+                if prev_equity is None:
+                    prev_equity = load_previous_equity(today)
+                    source = "equity_curve.parquet"
                 if prev_equity is not None and prev_equity != 0:
                     daily_pnl_pct = (account_value - prev_equity) / prev_equity
+                    logger.info("Kill-switch baseline: %s = %.2f", source, prev_equity)
+                else:
+                    logger.warning(
+                        "Kill switch disabled for this run: no trustworthy prior-equity "
+                        "baseline available (Alpaca unreachable and no fresh local "
+                        "equity-curve row within the staleness window)."
+                    )
             except Exception as exc:
                 logger.warning("Could not compute daily P&L (using 0.0): %s", exc)
 
@@ -672,7 +728,19 @@ def _run_daily_locked(
 
             client        = _make_trading_client()
             account_value = get_account_value(client)
-            orders        = submit_rebalance(client, final_trades, account_value)
+            # Idempotency guard: Step 7 runs at most once per logical trading
+            # day, so it's safe (and necessary) to tag every order with a
+            # key derived from *this run's* date. If Modal preempts the
+            # container mid-Step-7 and restarts the whole pipeline from
+            # scratch, the replayed submissions carry the same keys and
+            # Alpaca rejects them as duplicates instead of double-filling.
+            # Reuses `today` (not a fresh date.today()) so the key stays
+            # correct even when the clock is pinned by validation_dry_run's
+            # daily_run._today() patch in modal_app.py.
+            orders        = submit_rebalance(
+                client, final_trades, account_value,
+                idempotency_key_prefix=f"daily-{today}",
+            )
             result["orders"] = orders
 
             logger.info("Step 7 complete: %d order(s) submitted.", len(orders))

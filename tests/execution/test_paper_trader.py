@@ -28,10 +28,14 @@ def _mock_position(symbol: str, market_value: float) -> MagicMock:
     return pos
 
 
-def _mock_account(equity: str) -> MagicMock:
+def _mock_account(equity: str, last_equity: str | None = None) -> MagicMock:
     """Create a lightweight stand-in for an alpaca Account object."""
     acc = MagicMock()
     acc.equity = equity
+    if last_equity is not None:
+        acc.last_equity = last_equity
+    else:
+        del acc.last_equity  # simulate the attribute being genuinely absent
     return acc
 
 
@@ -85,6 +89,54 @@ def test_get_account_value():
 
     assert isinstance(result, float)
     assert result == 50000.0
+
+
+# ---------------------------------------------------------------------------
+# test_get_previous_close_equity — kill-switch baseline fix (2026-08-10)
+# ---------------------------------------------------------------------------
+
+def test_get_previous_close_equity_returns_float():
+    """get_previous_close_equity() converts account.last_equity to float.
+
+    This is Alpaca's own record of equity at the PREVIOUS trading day's
+    close — it is the preferred kill-switch baseline because it can't go
+    stale the way our local equity_curve.parquet can (see equity_tracker.
+    load_previous_equity's staleness guard for the bug this avoids)."""
+    from src.execution.paper_trader import get_previous_close_equity
+
+    client = MagicMock()
+    client.get_account.return_value = _mock_account(
+        equity="97940.69", last_equity="98552.31"
+    )
+
+    result = get_previous_close_equity(client)
+
+    assert isinstance(result, float)
+    assert result == pytest.approx(98552.31)
+
+
+def test_get_previous_close_equity_none_when_attribute_absent():
+    """If Alpaca's account object doesn't have last_equity at all, return
+    None rather than raising — the caller falls back to the next baseline."""
+    from src.execution.paper_trader import get_previous_close_equity
+
+    client = MagicMock()
+    client.get_account.return_value = _mock_account(equity="97940.69")  # no last_equity
+
+    assert get_previous_close_equity(client) is None
+
+
+def test_get_previous_close_equity_none_when_zero():
+    """A last_equity of "0" is not a usable baseline (a real paper account
+    should never be worth exactly $0) — treat it as absent, not as truth."""
+    from src.execution.paper_trader import get_previous_close_equity
+
+    client = MagicMock()
+    client.get_account.return_value = _mock_account(
+        equity="97940.69", last_equity="0"
+    )
+
+    assert get_previous_close_equity(client) is None
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +443,165 @@ def test_submit_rebalance_open_order_check_failure_does_not_block():
         results = submit_rebalance(client, trade_deltas, account_value=100_000.0)
 
     assert len(results) == 1
+    client.submit_order.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# test_submit_rebalance idempotency_key_prefix (preemption-replay guard)
+# ---------------------------------------------------------------------------
+
+def test_submit_rebalance_no_prefix_leaves_client_order_id_unset():
+    """Default behaviour (idempotency_key_prefix=None) must be unchanged:
+    no client_order_id is sent at all. This is what the intraday runner
+    relies on — it re-trades the same ticker/side across bars and must
+    never be blocked by a duplicate-order-id rejection."""
+    from src.execution.paper_trader import submit_rebalance
+
+    quote = _mock_quote(ask_price=100.0, bid_price=99.0)
+    mock_quote_response = {"AAPL": quote}
+
+    mock_order = MagicMock()
+    mock_order.id = "order-abc-123"
+    mock_order.status = "accepted"
+
+    client = MagicMock()
+    client.submit_order.return_value = mock_order
+
+    trade_deltas = pd.Series({"AAPL": 0.10})
+    with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
+        mock_data_fn.return_value.get_stock_latest_quote.return_value = mock_quote_response
+        results = submit_rebalance(client, trade_deltas, account_value=100_000.0)
+
+    assert len(results) == 1
+    submitted_request = client.submit_order.call_args[0][0]
+    assert submitted_request.client_order_id is None
+
+
+def test_submit_rebalance_with_prefix_sets_client_order_id_buy():
+    """When idempotency_key_prefix is supplied, a BUY order carries
+    client_order_id = f"{prefix}-{ticker}-buy"."""
+    from src.execution.paper_trader import submit_rebalance
+
+    quote = _mock_quote(ask_price=100.0, bid_price=99.0)
+    mock_quote_response = {"AAPL": quote}
+
+    mock_order = MagicMock()
+    mock_order.id = "order-abc-123"
+    mock_order.status = "accepted"
+
+    client = MagicMock()
+    client.submit_order.return_value = mock_order
+
+    trade_deltas = pd.Series({"AAPL": 0.10})
+    with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
+        mock_data_fn.return_value.get_stock_latest_quote.return_value = mock_quote_response
+        results = submit_rebalance(
+            client, trade_deltas, account_value=100_000.0,
+            idempotency_key_prefix="daily-2026-08-10",
+        )
+
+    assert len(results) == 1
+    submitted_request = client.submit_order.call_args[0][0]
+    assert submitted_request.client_order_id == "daily-2026-08-10-AAPL-buy"
+
+
+def test_submit_rebalance_with_prefix_sets_client_order_id_sell():
+    """When idempotency_key_prefix is supplied, a SELL order carries
+    client_order_id = f"{prefix}-{ticker}-sell"."""
+    from src.execution.paper_trader import submit_rebalance
+
+    quote = _mock_quote(ask_price=201.0, bid_price=200.0)
+    mock_quote_response = {"MSFT": quote}
+
+    mock_order = MagicMock()
+    mock_order.id = "order-xyz-456"
+    mock_order.status = "accepted"
+
+    client = MagicMock()
+    client.submit_order.return_value = mock_order
+    held_pos = _mock_position("MSFT", 40_000.0)
+    held_pos.qty = "200"  # comfortably more than the 25 shares this trade implies
+    client.get_all_positions.return_value = [held_pos]
+
+    trade_deltas = pd.Series({"MSFT": -0.05})
+    with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
+        mock_data_fn.return_value.get_stock_latest_quote.return_value = mock_quote_response
+        results = submit_rebalance(
+            client, trade_deltas, account_value=100_000.0,
+            idempotency_key_prefix="daily-2026-08-10",
+        )
+
+    assert len(results) == 1
+    submitted_request = client.submit_order.call_args[0][0]
+    assert submitted_request.client_order_id == "daily-2026-08-10-MSFT-sell"
+
+
+def test_submit_rebalance_duplicate_rejection_is_skipped_and_run_continues():
+    """A duplicate-client_order_id rejection from Alpaca (the signature of a
+    preemption replay) is swallowed: it must not raise, must not appear in
+    results, and must not stop the rest of the batch from being processed —
+    the very next ticker should still submit normally."""
+    from src.execution.paper_trader import submit_rebalance
+
+    quote_a = _mock_quote(ask_price=100.0, bid_price=99.0)
+    quote_b = _mock_quote(ask_price=50.0, bid_price=49.0)
+
+    mock_order_ok = MagicMock()
+    mock_order_ok.id = "order-ok-1"
+    mock_order_ok.status = "accepted"
+
+    duplicate_exc = Exception(
+        "order with client_order_id already exists: must be unique"
+    )
+
+    client = MagicMock()
+    client.submit_order.side_effect = [duplicate_exc, mock_order_ok]
+
+    # dict preserves insertion order → DUPTICK processed before OKTICK, and
+    # the quote lookups are consumed in that same order.
+    trade_deltas = pd.Series({"DUPTICK": 0.10, "OKTICK": 0.10})
+    with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
+        mock_data_fn.return_value.get_stock_latest_quote.side_effect = [
+            {"DUPTICK": quote_a},
+            {"OKTICK": quote_b},
+        ]
+        results = submit_rebalance(
+            client, trade_deltas, account_value=100_000.0,
+            idempotency_key_prefix="daily-2026-08-10",
+        )
+
+    tickers_in_results = {r["ticker"] for r in results}
+    assert "DUPTICK" not in tickers_in_results, (
+        "A duplicate-rejected order must not be counted as submitted."
+    )
+    assert "OKTICK" in tickers_in_results, (
+        "Processing must continue to the next ticker after a duplicate rejection."
+    )
+    assert len(results) == 1
+    assert client.submit_order.call_count == 2
+
+
+def test_submit_rebalance_genuine_error_still_uses_warning_path():
+    """A non-duplicate exception (e.g. a real network/API failure) must
+    still take the pre-existing WARNING-and-skip path, not be mistaken for
+    a duplicate-order rejection."""
+    from src.execution.paper_trader import submit_rebalance
+
+    quote = _mock_quote(ask_price=100.0, bid_price=99.0)
+    mock_quote_response = {"FAILTICK": quote}
+
+    client = MagicMock()
+    client.submit_order.side_effect = RuntimeError("connection reset by peer")
+
+    trade_deltas = pd.Series({"FAILTICK": 0.10})
+    with patch("src.execution.paper_trader._make_data_client") as mock_data_fn:
+        mock_data_fn.return_value.get_stock_latest_quote.return_value = mock_quote_response
+        results = submit_rebalance(
+            client, trade_deltas, account_value=100_000.0,
+            idempotency_key_prefix="daily-2026-08-10",
+        )
+
+    assert results == []
     client.submit_order.assert_called_once()
 
 

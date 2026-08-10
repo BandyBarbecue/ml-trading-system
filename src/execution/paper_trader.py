@@ -160,6 +160,42 @@ def get_account_value(client: TradingClient) -> float:
     return float(account.equity)
 
 
+def get_previous_close_equity(client: TradingClient) -> float | None:
+    """Return the account's total equity as of the PREVIOUS trading day's close.
+
+    Alpaca tracks this itself as `account.last_equity` — it is set once per
+    day when the exchange closes and does not move again until the next
+    close, regardless of how many times (or how rarely) we call this API.
+    That makes it immune to gaps in OUR OWN equity_curve.parquet history: if
+    our daily run fails for a month, Alpaca's `last_equity` still reflects
+    yesterday's close, not whenever we last happened to check. This is the
+    preferred baseline for the kill switch for exactly that reason — see
+    equity_tracker.load_previous_equity for the same-day-gap problem this
+    avoids.
+
+    Parameters
+    ----------
+    client:  An authenticated TradingClient.
+
+    Returns
+    -------
+    Previous close equity as a float, or None if `last_equity` is missing,
+    None, or parses to 0 (a real account should never be worth exactly $0,
+    so treat that as "not a usable value" rather than trusting it).
+    """
+    account = client.get_account()
+    raw = getattr(account, "last_equity", None)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value == 0:
+        return None
+    return value
+
+
 def get_current_positions(client: TradingClient) -> pd.Series:
     """Return current portfolio weights indexed by ticker symbol.
 
@@ -201,6 +237,7 @@ def submit_rebalance(
     client: TradingClient,
     trade_deltas: pd.Series,  # positive = buy, negative = sell
     account_value: float,     # total account equity in $
+    idempotency_key_prefix: str | None = None,
 ) -> list[dict]:
     """Convert weight deltas into integer share counts and submit market orders.
 
@@ -221,11 +258,34 @@ def submit_rebalance(
     client:         An authenticated TradingClient.
     trade_deltas:   pd.Series of weight deltas, indexed by ticker symbol.
     account_value:  Total account equity in dollars (used to size orders).
+    idempotency_key_prefix:
+        Opt-in replay guard for callers that run AT MOST ONCE per logical
+        batch (currently only daily_run.py's Step 7).  When None (the
+        default), behaviour is exactly as before this parameter existed:
+        no `client_order_id` is sent, so Alpaca treats every submission as
+        brand new.  This is required for the intraday runner, which calls
+        `submit_rebalance` many times a day and legitimately re-trades the
+        same ticker/side on different bars — tagging those calls would
+        block real, intended repeat trades.
+
+        When a string is supplied, every order in this batch is given
+            client_order_id = f"{idempotency_key_prefix}-{ticker}-{side.value}"
+        Think of it like a cheque number: a bank honours cheque #123 once,
+        and a second cheque with the same number bounces instead of paying
+        out twice. Here Alpaca is the bank — it enforces `client_order_id`
+        uniqueness per account, so if a Modal container is preempted mid-run
+        and the whole pipeline restarts from scratch (see daily_run.py's
+        Step 7 caller), the replayed submission reuses the same "cheque
+        number" and Alpaca rejects it as a duplicate instead of filling the
+        same order twice.
 
     Returns
     -------
     List of order result dicts, one per successfully submitted order:
         {"ticker": str, "side": str, "shares": int, "status": str}
+    A duplicate submission that Alpaca rejects (see idempotency_key_prefix
+    above) is NOT included here — it was not a new order, so it must not be
+    counted as one.
     """
     results: list[dict] = []
     data_client = _make_data_client()
@@ -328,12 +388,19 @@ def submit_rebalance(
             continue
 
         # --- Submit the order ---------------------------------------------------
-        order_request = MarketOrderRequest(
+        # Only attach a client_order_id when the caller opted in (see the
+        # idempotency_key_prefix docstring above) — the intraday caller must
+        # keep sending unadorned requests so it can legitimately re-trade the
+        # same ticker/side on later bars.
+        order_kwargs = dict(
             symbol=ticker,
             qty=shares,
             side=side,
             time_in_force=TimeInForce.DAY,
         )
+        if idempotency_key_prefix is not None:
+            order_kwargs["client_order_id"] = f"{idempotency_key_prefix}-{ticker}-{side.value}"
+        order_request = MarketOrderRequest(**order_kwargs)
 
         try:
             order = client.submit_order(order_request)
@@ -348,6 +415,24 @@ def submit_rebalance(
                 side.value, shares, ticker, order.id, order.status,
             )
         except Exception as exc:
+            # Detect "this client_order_id was already used" rejections and
+            # treat them as the idempotency guard working as intended, not a
+            # failure. We match on the message text (lowercased) rather than
+            # an exact status code because alpaca-py surfaces this as a
+            # generic APIError — there is no specific exception subclass to
+            # catch, so the message is the only reliable signal.
+            exc_text = str(exc).lower()
+            is_duplicate = "client_order_id" in exc_text and any(
+                signal in exc_text for signal in ("exist", "duplicate", "unique")
+            )
+            if is_duplicate:
+                logger.info(
+                    "Order for %s already submitted for this batch (id prefix "
+                    "%r) — this is the preemption-replay guard working as "
+                    "intended, not an error. Skipping.",
+                    ticker, idempotency_key_prefix,
+                )
+                continue
             logger.warning("Order submission failed for %s: %s — skipping.", ticker, exc)
             continue
 
